@@ -719,9 +719,18 @@ inline void GetBoxCoverage(double x, double y, const RenderRefcon *refcon,
 
 inline void RefineSubpixelBBoxes(std::vector<BBox> &boxes,
                                  PF_EffectWorld *input, bool is_deep) {
+  if (!input || !input->data || boxes.empty()) {
+    return;
+  }
+
   double max_val = is_deep ? 32768.0 : 255.0;
 
   for (auto &box : boxes) {
+    // Skip invalid bounding boxes
+    if (box.min_x > box.max_x || box.min_y > box.max_y) {
+      continue;
+    }
+
     // 1. Calculate subpixel centroid (cx, cy)
     double sum_alpha = 0.0;
     double sum_x = 0.0;
@@ -739,8 +748,14 @@ inline void RefineSubpixelBBoxes(std::vector<BBox> &boxes,
     if (int_min_y < 0) int_min_y = 0;
     if (int_max_y >= input->height) int_max_y = input->height - 1;
 
-    std::vector<double> ProfileX(int_max_x - int_min_x + 1, 0.0);
-    std::vector<double> ProfileY(int_max_y - int_min_y + 1, 0.0);
+    int width_range = int_max_x - int_min_x + 1;
+    int height_range = int_max_y - int_min_y + 1;
+    if (width_range <= 0 || height_range <= 0) {
+      continue;
+    }
+
+    std::vector<double> ProfileX(width_range, 0.0);
+    std::vector<double> ProfileY(height_range, 0.0);
 
     for (int y = int_min_y; y <= int_max_y; ++y) {
       void *row = (char *)input->data + y * input->rowbytes;
@@ -908,6 +923,9 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
                                   int target_mode, double word_gap_mult,
                                   double line_gap_mult) {
   std::vector<BBox> result;
+  if (!input || !input->data) {
+    return result;
+  }
   int width = input->width;
   int height = input->height;
   bool is_deep = PF_WORLD_IS_DEEP(input);
@@ -1143,7 +1161,15 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
       std::vector<bool> col_active(bw, false);
       for (int col = 0; col < bw; ++col) {
         int img_x = (int)floor(box.min_x) + col;
-        for (int row_y = (int)floor(box.min_y); row_y <= (int)ceil(box.max_y); ++row_y) {
+        if (img_x < 0 || img_x >= width) {
+          continue;
+        }
+        int start_y = (int)floor(box.min_y);
+        int end_y = (int)ceil(box.max_y);
+        if (start_y < 0) start_y = 0;
+        if (end_y >= height) end_y = height - 1;
+
+        for (int row_y = start_y; row_y <= end_y; ++row_y) {
           void *row_ptr = (char *)input->data + row_y * input->rowbytes;
           bool active = false;
           if (is_deep) {
@@ -1997,6 +2023,8 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
 
   std::vector<PF_ParamDef> input_checkouts(rc.num_samples);
   std::vector<PF_ParamDef> custom_checkouts(rc.num_samples);
+  std::vector<bool> input_checkout_success(rc.num_samples, false);
+  std::vector<bool> custom_checkout_success(rc.num_samples, false);
   for (int i = 0; i < rc.num_samples; ++i) {
     AEFX_CLR_STRUCT(input_checkouts[i]);
     AEFX_CLR_STRUCT(custom_checkouts[i]);
@@ -2005,15 +2033,19 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
   for (int i = 0; i < rc.num_samples; ++i) {
     A_long t_i = sample_times[i];
 
-    PF_Err checkout_err =
-        PF_CHECKOUT_PARAM(in_data, MGA_INPUT, t_i, in_data->time_step,
-                          in_data->time_scale, &input_checkouts[i]);
-
     PF_EffectWorld *input_world = nullptr;
-    if (checkout_err == PF_Err_NONE) {
-      input_world = &input_checkouts[i].u.ld;
-    } else {
+    if (t_i == in_data->current_time) {
       input_world = &params[MGA_INPUT]->u.ld;
+    } else {
+      PF_Err checkout_err =
+          PF_CHECKOUT_PARAM(in_data, MGA_INPUT, t_i, in_data->time_step,
+                            in_data->time_scale, &input_checkouts[i]);
+      if (checkout_err == PF_Err_NONE) {
+        input_checkout_success[i] = true;
+        input_world = &input_checkouts[i].u.ld;
+      } else {
+        input_world = &params[MGA_INPUT]->u.ld;
+      }
     }
 
     rc.samples[i].boxes =
@@ -2025,13 +2057,15 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
       PF_Err custom_err =
           PF_CHECKOUT_PARAM(in_data, MGA_CUSTOM_LAYER, t_i, in_data->time_step,
                             in_data->time_scale, &custom_checkouts[i]);
-      if (custom_err == PF_Err_NONE &&
-          custom_checkouts[i].u.ld.data != nullptr) {
-        rc.samples[i].has_custom_layer = true;
-        rc.samples[i].custom_world = custom_checkouts[i].u.ld;
-        rc.samples[i].custom_bounds = GetWorldContentBounds(
-            &rc.samples[i].custom_world,
-            PF_WORLD_IS_DEEP(&rc.samples[i].custom_world) != 0);
+      if (custom_err == PF_Err_NONE) {
+        custom_checkout_success[i] = true;
+        if (custom_checkouts[i].u.ld.data != nullptr) {
+          rc.samples[i].has_custom_layer = true;
+          rc.samples[i].custom_world = custom_checkouts[i].u.ld;
+          rc.samples[i].custom_bounds = GetWorldContentBounds(
+              &rc.samples[i].custom_world,
+              PF_WORLD_IS_DEEP(&rc.samples[i].custom_world) != 0);
+        }
       }
     }
   }
@@ -2117,10 +2151,10 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
                     output, PF_WORLD_IS_DEEP(output) != 0);
 
   for (int i = 0; i < rc.num_samples; ++i) {
-    if (input_checkouts[i].u.ld.data != nullptr) {
+    if (input_checkout_success[i]) {
       PF_CHECKIN_PARAM(in_data, &input_checkouts[i]);
     }
-    if (custom_checkouts[i].u.ld.data != nullptr) {
+    if (custom_checkout_success[i]) {
       PF_CHECKIN_PARAM(in_data, &custom_checkouts[i]);
     }
   }
@@ -2217,6 +2251,8 @@ static PF_Err UpdateParameterUI(PF_InData *in_data, PF_OutData *out_data,
 
     // Fill outline hiding (only show in Text Outline mode)
     SetParamHiddenAEGP(MGA_FILL_OUTLINE, mode != MGA_MODE_TEXT_OUTLINE);
+
+    suites.EffectSuite4()->AEGP_DisposeEffect(effectH);
   }
   return err;
 }
