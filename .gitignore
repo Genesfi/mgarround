@@ -1,0 +1,25 @@
+# Visual Studio
+.vs/
+*.vcxproj.user
+
+# Build output (Windows)
+Win/x64/
+Win/Debug/
+Win/Release/
+build/
+build_debug/
+BuildOutput/
+
+# Object/intermediate files
+*.obj
+*.sbr
+*.bsc
+*.exp
+*.lib
+*.pdb
+*.log
+*.tlog
+*.recipe
+*.res
+*.rr
+*.rrc
