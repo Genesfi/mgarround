@@ -43,21 +43,17 @@ static AEGP_PluginID s_my_aegp_id = 0;
 // "Comp Setting"), which is pure overhead in production. Use MGA_LOG(x)
 // everywhere instead of calling write_log directly.
 // ---------------------------------------------------------------------
-#ifdef _DEBUG
 inline void write_log(const std::string &msg) {
   std::lock_guard<std::mutex> lock(log_mutex);
   std::ofstream f("C:\\Users\\Gusti "
-                  "N\\.gemini\\antigravity-ide\\brain\\ec9993e8-251a-4ca6-b8c1-"
-                  "98a215815989\\ae_log.txt",
+                  "N\\.gemini\\antigravity-ide\\brain\\767a8f19-7caf-4d8d-b666-"
+                  "d6b89e1b80be\\ae_log.txt",
                   std::ios::app);
   if (f.is_open()) {
     f << msg << "\n";
   }
 }
 #define MGA_LOG(x) write_log(x)
-#else
-#define MGA_LOG(x) ((void)0)
-#endif
 
 #ifndef min
 #define min(a, b) (((a) < (b)) ? (a) : (b))
@@ -68,8 +64,8 @@ inline void write_log(const std::string &msg) {
 #endif
 
 struct BBox {
-  int min_x, max_x;
-  int min_y, max_y;
+  double min_x, max_x;
+  double min_y, max_y;
   double cx, cy;
   double max_alpha;
 };
@@ -114,6 +110,7 @@ struct BBoxDouble {
 // ---------------------------------------------------------------------
 struct PrecomputedBox {
   double box_cx, box_cy;
+  double geom_cx, geom_cy;
   double box_w, box_h;
   double half_w, half_h;
   double clamped_r;
@@ -238,16 +235,23 @@ inline void PrecomputeBoxGeometry(const std::vector<BBox> &boxes,
     double cx = (box.min_x + box.max_x) / 2.0;
     double cy = (box.min_y + box.max_y) / 2.0;
 
-    pb.box_cx = cx + refcon->render_offset_x;
-    pb.box_cy = cy + refcon->render_offset_y;
-
     double W_eval = refcon->consistent_size ? refcon->max_char_w : W;
     double H_eval = refcon->consistent_size ? refcon->max_char_h : H;
 
     pb.box_w = (W_eval + refcon->render_pad_left + refcon->render_pad_right) *
-               (refcon->scale_x_pct / 100.0);
+        (refcon->scale_x_pct / 100.0);
     pb.box_h = (H_eval + refcon->render_pad_top + refcon->render_pad_bottom) *
-               (refcon->scale_y_pct / 100.0);
+        (refcon->scale_y_pct / 100.0);
+
+    // Geser titik tengah box sesuai selisih padding kiri/kanan & atas/bawah,
+    // supaya nambah pad_right cuma melebarkan ke kanan, bukan dua-duanya.
+    double pad_shift_x = (refcon->render_pad_right - refcon->render_pad_left) *
+        (refcon->scale_x_pct / 100.0) / 2.0;
+    double pad_shift_y = (refcon->render_pad_bottom - refcon->render_pad_top) *
+        (refcon->scale_y_pct / 100.0) / 2.0;
+
+    pb.box_cx = cx + refcon->render_offset_x + pad_shift_x;
+    pb.box_cy = cy + refcon->render_offset_y + pad_shift_y;
 
     pb.half_w = pb.box_w / 2.0;
     pb.half_h = pb.box_h / 2.0;
@@ -549,13 +553,13 @@ inline void GetBoxCoverage(double x, double y, const RenderRefcon *refcon,
           double smp_r = 0.0, smp_g = 0.0, smp_b = 0.0, smp_a = 0.0;
           double max_val = is_deep ? 32768.0 : 255.0;
           if (is_deep) {
-            sample_bilinear<PF_Pixel16, PF_Pixel16>(&sample.input_world, u_world,
-                                                    v_world, &smp_r, &smp_g,
-                                                    &smp_b, &smp_a, max_val);
+            sample_bilinear<PF_Pixel16, PF_Pixel16>(
+                &sample.input_world, u_world, v_world, &smp_r, &smp_g, &smp_b,
+                &smp_a, max_val);
           } else {
             sample_bilinear<PF_Pixel8, PF_Pixel8>(&sample.input_world, u_world,
-                                                  v_world, &smp_r, &smp_g, &smp_b,
-                                                  &smp_a, max_val);
+                                                  v_world, &smp_r, &smp_g,
+                                                  &smp_b, &smp_a, max_val);
           }
 
           current_alpha = outline_a + smp_a * (1.0 - outline_a);
@@ -564,12 +568,15 @@ inline void GetBoxCoverage(double x, double y, const RenderRefcon *refcon,
             double outline_g = refcon->outline_color.green / 255.0;
             double outline_b = refcon->outline_color.blue / 255.0;
 
-            cur_r = (outline_r * outline_a + smp_r * smp_a * (1.0 - outline_a)) /
-                    current_alpha;
-            cur_g = (outline_g * outline_a + smp_g * smp_a * (1.0 - outline_a)) /
-                    current_alpha;
-            cur_b = (outline_b * outline_a + smp_b * smp_a * (1.0 - outline_a)) /
-                    current_alpha;
+            cur_r =
+                (outline_r * outline_a + smp_r * smp_a * (1.0 - outline_a)) /
+                current_alpha;
+            cur_g =
+                (outline_g * outline_a + smp_g * smp_a * (1.0 - outline_a)) /
+                current_alpha;
+            cur_b =
+                (outline_b * outline_a + smp_b * smp_a * (1.0 - outline_a)) /
+                current_alpha;
           }
         } else {
           current_alpha = outline_a;
@@ -710,37 +717,42 @@ inline void GetBoxCoverage(double x, double y, const RenderRefcon *refcon,
   *out_b = blended_b;
 }
 
-inline void CalculateSubpixelCenters(std::vector<BBox> &boxes,
-                                     PF_EffectWorld *input, bool is_deep) {
+inline void RefineSubpixelBBoxes(std::vector<BBox> &boxes,
+                                 PF_EffectWorld *input, bool is_deep) {
+  double max_val = is_deep ? 32768.0 : 255.0;
+
   for (auto &box : boxes) {
+    // 1. Calculate subpixel centroid (cx, cy)
     double sum_alpha = 0.0;
     double sum_x = 0.0;
     double sum_y = 0.0;
 
-    if (is_deep) {
-      for (int y = box.min_y; y <= box.max_y; ++y) {
-        PF_Pixel16 *row =
-            (PF_Pixel16 *)((char *)input->data + y * input->rowbytes);
-        for (int x = box.min_x; x <= box.max_x; ++x) {
-          double alpha = row[x].alpha / 32768.0;
-          if (alpha > 0.0) {
-            sum_alpha += alpha;
-            sum_x += x * alpha;
-            sum_y += y * alpha;
-          }
-        }
-      }
-    } else {
-      for (int y = box.min_y; y <= box.max_y; ++y) {
-        PF_Pixel8 *row =
-            (PF_Pixel8 *)((char *)input->data + y * input->rowbytes);
-        for (int x = box.min_x; x <= box.max_x; ++x) {
-          double alpha = row[x].alpha / 255.0;
-          if (alpha > 0.0) {
-            sum_alpha += alpha;
-            sum_x += x * alpha;
-            sum_y += y * alpha;
-          }
+    // Expand search range by 2 pixels on all sides to prevent the active pixel scanning
+    // from being truncated when the integer CCL bounding box jumps.
+    int int_min_x = (int)floor(box.min_x) - 2;
+    int int_max_x = (int)ceil(box.max_x) + 2;
+    int int_min_y = (int)floor(box.min_y) - 2;
+    int int_max_y = (int)ceil(box.max_y) + 2;
+
+    if (int_min_x < 0) int_min_x = 0;
+    if (int_max_x >= input->width) int_max_x = input->width - 1;
+    if (int_min_y < 0) int_min_y = 0;
+    if (int_max_y >= input->height) int_max_y = input->height - 1;
+
+    std::vector<double> ProfileX(int_max_x - int_min_x + 1, 0.0);
+    std::vector<double> ProfileY(int_max_y - int_min_y + 1, 0.0);
+
+    for (int y = int_min_y; y <= int_max_y; ++y) {
+      void *row = (char *)input->data + y * input->rowbytes;
+      for (int x = int_min_x; x <= int_max_x; ++x) {
+        double alpha = is_deep ? (((PF_Pixel16 *)row)[x].alpha / max_val)
+                               : (((PF_Pixel8 *)row)[x].alpha / max_val);
+        if (alpha > 0.0) {
+          sum_alpha += alpha;
+          sum_x += x * alpha;
+          sum_y += y * alpha;
+          ProfileX[x - int_min_x] += alpha;
+          ProfileY[y - int_min_y] += alpha;
         }
       }
     }
@@ -751,6 +763,143 @@ inline void CalculateSubpixelCenters(std::vector<BBox> &boxes,
     } else {
       box.cx = (box.min_x + box.max_x) / 2.0;
       box.cy = (box.min_y + box.max_y) / 2.0;
+    }
+
+    double orig_min_x = box.min_x;
+    double orig_max_x = box.max_x;
+    double orig_min_y = box.min_y;
+    double orig_max_y = box.max_y;
+
+    double sum_alpha_x = 0.0;
+    for (double val : ProfileX) sum_alpha_x += val;
+    double sum_alpha_y = 0.0;
+    for (double val : ProfileY) sum_alpha_y += val;
+
+    // Cumulative sum threshold (5.0 alpha represents about 5 pixels of opaque height,
+    // which lies in the linear region of the cumulative sum and has zero interpolation error).
+    double T_x = 5.0;
+    double T_y = 5.0;
+
+    double max_px = 0.0;
+    for (double val : ProfileX) { if (val > max_px) max_px = val; }
+    double max_py = 0.0;
+    for (double val : ProfileY) { if (val > max_py) max_py = val; }
+
+    // Adapt threshold for small components
+    if (sum_alpha_x < 50.0) {
+      T_x = 0.1 * sum_alpha_x;
+    }
+    if (sum_alpha_y < 50.0) {
+      T_y = 0.1 * sum_alpha_y;
+    }
+
+    double offset_x = T_x / (max_px > 0.0 ? max_px : 1.0) + 0.5;
+    double offset_y = T_y / (max_py > 0.0 ? max_py : 1.0) + 0.5;
+
+    // Limit offset to reasonable values to prevent extreme cases
+    if (offset_x > 3.0) offset_x = 3.0;
+    if (offset_y > 3.0) offset_y = 3.0;
+
+    // 2. Refine min_x and max_x using cumulative sum
+    if (sum_alpha_x > 2.0 * T_x) {
+      // Left boundary (cumulative from left to right)
+      double cum = 0.0;
+      for (size_t i = 0; i < ProfileX.size(); ++i) {
+        double val = ProfileX[i];
+        double prev_cum = cum;
+        cum += val;
+        if (cum > T_x) {
+          double interp_i = (double)i;
+          if (val > 0.0) {
+            interp_i = (double)i - 1.0 + (T_x - prev_cum) / val;
+          }
+          box.min_x = int_min_x + interp_i - offset_x;
+          break;
+        }
+      }
+
+      // Right boundary (cumulative from right to left)
+      cum = 0.0;
+      for (int i = (int)ProfileX.size() - 1; i >= 0; --i) {
+        double val = ProfileX[i];
+        double prev_cum = cum;
+        cum += val;
+        if (cum > T_x) {
+          double interp_i = (double)i;
+          if (val > 0.0) {
+            interp_i = (double)i + 1.0 - (T_x - prev_cum) / val;
+          }
+          box.max_x = int_min_x + interp_i + offset_x;
+          break;
+        }
+      }
+    }
+
+    // 3. Refine min_y and max_y using cumulative sum
+    if (sum_alpha_y > 2.0 * T_y) {
+      // Top boundary (cumulative from top to bottom)
+      double cum = 0.0;
+      for (size_t i = 0; i < ProfileY.size(); ++i) {
+        double val = ProfileY[i];
+        double prev_cum = cum;
+        cum += val;
+        if (cum > T_y) {
+          double interp_i = (double)i;
+          if (val > 0.0) {
+            interp_i = (double)i - 1.0 + (T_y - prev_cum) / val;
+          }
+          box.min_y = int_min_y + interp_i - offset_y;
+          break;
+        }
+      }
+
+      // Bottom boundary (cumulative from bottom to top)
+      cum = 0.0;
+      for (int i = (int)ProfileY.size() - 1; i >= 0; --i) {
+        double val = ProfileY[i];
+        double prev_cum = cum;
+        cum += val;
+        if (cum > T_y) {
+          double interp_i = (double)i;
+          if (val > 0.0) {
+            interp_i = (double)i + 1.0 - (T_y - prev_cum) / val;
+          }
+          box.max_y = int_min_y + interp_i + offset_y;
+          break;
+        }
+      }
+    }
+
+    double var_x = 0.0;
+    if (sum_alpha > 0.0) {
+      double sum_sq_diff = 0.0;
+      for (size_t i = 0; i < ProfileX.size(); ++i) {
+        double x_coord = (double)int_min_x + (double)i;
+        sum_sq_diff += ProfileX[i] * (x_coord - box.cx) * (x_coord - box.cx);
+      }
+      var_x = sum_sq_diff / sum_alpha;
+    }
+    double sigma_x = sqrt(var_x);
+
+    {
+      std::stringstream ss;
+      ss << "Refinement: "
+         << "Input=[" << orig_min_x << ", " << orig_max_x << ", " << orig_min_y << ", " << orig_max_y << "] "
+         << "Output=[" << box.min_x << ", " << box.max_x << ", " << box.min_y << ", " << box.max_y << "] "
+         << "W=" << (box.max_x - box.min_x + 1.0) << " H=" << (box.max_y - box.min_y + 1.0) << " "
+         << "GeomCenter=[" << (box.min_x + box.max_x)/2.0 << ", " << (box.min_y + box.max_y)/2.0 << "] "
+         << "sigma_x=" << sigma_x << " ratio=" << ((box.max_x - box.min_x) / (sigma_x > 0.0 ? sigma_x : 1.0));
+      MGA_LOG(ss.str());
+    }
+
+    {
+      std::stringstream ss;
+      ss << "ProfileX right edge values: ";
+      int start_idx = max(0, (int)ProfileX.size() - 8);
+      for (int i = start_idx; i < (int)ProfileX.size(); ++i) {
+        ss << "col[" << (int_min_x + i) << "]=" << ProfileX[i] << " ";
+      }
+      MGA_LOG(ss.str());
     }
   }
 }
@@ -877,18 +1026,18 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
         }
 
         if (label_bboxes.find(root_l) == label_bboxes.end()) {
-          BBox box = {px, px, py, py, 0.0, 0.0, alpha_val};
+          BBox box = {(double)px, (double)px, (double)py, (double)py, 0.0, 0.0, alpha_val};
           label_bboxes[root_l] = box;
         } else {
           BBox &box = label_bboxes[root_l];
-          if (px < box.min_x)
-            box.min_x = px;
-          if (px > box.max_x)
-            box.max_x = px;
-          if (py < box.min_y)
-            box.min_y = py;
-          if (py > box.max_y)
-            box.max_y = py;
+          if ((double)px < box.min_x)
+            box.min_x = (double)px;
+          if ((double)px > box.max_x)
+            box.max_x = (double)px;
+          if ((double)py < box.min_y)
+            box.min_y = (double)py;
+          if ((double)py > box.max_y)
+            box.max_y = (double)py;
           if (alpha_val > box.max_alpha)
             box.max_alpha = alpha_val;
         }
@@ -899,8 +1048,8 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
   std::vector<BBox> boxes;
   for (const auto &pair : label_bboxes) {
     const BBox &box = pair.second;
-    int bw = box.max_x - box.min_x + 1;
-    int bh = box.max_y - box.min_y + 1;
+    int bw = (int)round(box.max_x - box.min_x + 1.0);
+    int bh = (int)round(box.max_y - box.min_y + 1.0);
     if (bw <= 1 && bh <= 1) {
       continue; // Ignore 1x1 noise components
     }
@@ -941,27 +1090,27 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
           BBox &A = boxes[i];
           BBox &B = boxes[j];
 
-          int ay_h = A.max_y - A.min_y + 1;
-          int by_h = B.max_y - B.min_y + 1;
-          int avg_h = (ay_h + by_h) / 2;
+          double ay_h = A.max_y - A.min_y + 1.0;
+          double by_h = B.max_y - B.min_y + 1.0;
+          double avg_h = (ay_h + by_h) / 2.0;
 
-          int h_dist = 0;
+          double h_dist = 0.0;
           if (A.max_x < B.min_x)
             h_dist = B.min_x - A.max_x;
           else if (B.max_x < A.min_x)
             h_dist = A.min_x - B.max_x;
           else
-            h_dist = 0;
+            h_dist = 0.0;
 
-          int v_dist = 0;
+          double v_dist = 0.0;
           if (A.max_y < B.min_y)
             v_dist = B.min_y - A.max_y;
           else if (B.max_y < A.min_y)
             v_dist = A.min_y - B.max_y;
           else
-            v_dist = 0;
+            v_dist = 0.0;
 
-          if (h_dist <= 3 && v_dist <= avg_h * 0.8) {
+          if (h_dist <= 3.0 && v_dist <= avg_h * 0.8) {
             A.min_x = min(A.min_x, B.min_x);
             A.max_x = max(A.max_x, B.max_x);
             A.min_y = min(A.min_y, B.min_y);
@@ -984,7 +1133,7 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
     // characters that got merged (common at low preview resolutions)
     std::vector<BBox> split_boxes;
     for (const auto &box : boxes) {
-      int bw = box.max_x - box.min_x + 1;
+      int bw = (int)round(box.max_x - box.min_x + 1.0);
       if (bw <= 2) {
         split_boxes.push_back(box);
         continue;
@@ -993,8 +1142,8 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
       // Build column occupancy: does this column have any active pixels?
       std::vector<bool> col_active(bw, false);
       for (int col = 0; col < bw; ++col) {
-        int img_x = box.min_x + col;
-        for (int row_y = box.min_y; row_y <= box.max_y; ++row_y) {
+        int img_x = (int)floor(box.min_x) + col;
+        for (int row_y = (int)floor(box.min_y); row_y <= (int)ceil(box.max_y); ++row_y) {
           void *row_ptr = (char *)input->data + row_y * input->rowbytes;
           bool active = false;
           if (is_deep) {
@@ -1048,18 +1197,18 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
           BBox &B = split_boxes[j];
 
           // Check if they overlap horizontally (same column range)
-          int overlap_x =
-              max(0, min(A.max_x, B.max_x) - max(A.min_x, B.min_x) + 1);
-          int min_w = min(A.max_x - A.min_x + 1, B.max_x - B.min_x + 1);
+          double overlap_x =
+              max(0.0, min(A.max_x, B.max_x) - max(A.min_x, B.min_x) + 1.0);
+          double min_w = min(A.max_x - A.min_x + 1.0, B.max_x - B.min_x + 1.0);
           if (overlap_x > min_w * 0.3) {
             // Vertically close? Merge them
-            int v_dist = 0;
+            double v_dist = 0.0;
             if (A.max_y < B.min_y)
               v_dist = B.min_y - A.max_y;
             else if (B.max_y < A.min_y)
               v_dist = A.min_y - B.max_y;
 
-            int avg_h = ((A.max_y - A.min_y + 1) + (B.max_y - B.min_y + 1)) / 2;
+            double avg_h = ((A.max_y - A.min_y + 1.0) + (B.max_y - B.min_y + 1.0)) / 2.0;
             if (v_dist <= avg_h * 0.5) {
               A.min_x = min(A.min_x, B.min_x);
               A.max_x = max(A.max_x, B.max_x);
@@ -1081,7 +1230,7 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
     std::sort(split_boxes.begin(), split_boxes.end(),
               [](const BBox &a, const BBox &b) { return a.min_x < b.min_x; });
 
-    CalculateSubpixelCenters(split_boxes, input, is_deep);
+    RefineSubpixelBBoxes(split_boxes, input, is_deep);
     return split_boxes;
   }
 
@@ -1090,18 +1239,18 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
     bool found_line = false;
     for (auto &line : lines) {
       // Find the combined vertical span of all boxes in this line
-      int line_min_y = line[0].min_y;
-      int line_max_y = line[0].max_y;
+      double line_min_y = line[0].min_y;
+      double line_max_y = line[0].max_y;
       for (const auto &b : line) {
         if (b.min_y < line_min_y)
           line_min_y = b.min_y;
         if (b.max_y > line_max_y)
           line_max_y = b.max_y;
       }
-      int line_h = line_max_y - line_min_y + 1;
-      int box_h = box.max_y - box.min_y + 1;
-      int overlap =
-          max(0, min(line_max_y, box.max_y) - max(line_min_y, box.min_y) + 1);
+      double line_h = line_max_y - line_min_y + 1.0;
+      double box_h = box.max_y - box.min_y + 1.0;
+      double overlap =
+          max(0.0, min(line_max_y, box.max_y) - max(line_min_y, box.min_y) + 1.0);
       if (overlap > 0.3 * min(line_h, box_h)) {
         line.push_back(box);
         found_line = true;
@@ -1125,7 +1274,7 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
 
       double avg_h = 0.0;
       for (const auto &b : line) {
-        avg_h += (b.max_y - b.min_y + 1);
+        avg_h += (b.max_y - b.min_y + 1.0);
       }
       avg_h /= line.size();
 
@@ -1133,7 +1282,7 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
       word.push_back(line[0]);
 
       for (size_t i = 1; i < line.size(); ++i) {
-        int gap = line[i].min_x - line[i - 1].max_x;
+        double gap = line[i].min_x - line[i - 1].max_x;
         if (gap > word_gap_mult * avg_h) {
           BBox w_box = {word[0].min_x,    word[0].max_x, word[0].min_y,
                         word[0].max_y,    0.0,           0.0,
@@ -1172,7 +1321,7 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
         max_a_whole = b.max_alpha;
       }
     }
-    BBox whole = {g_min_x, g_max_x, g_min_y, g_max_y, 0.0, 0.0, max_a_whole};
+    BBox whole = {(double)g_min_x, (double)g_max_x, (double)g_min_y, (double)g_max_y, 0.0, 0.0, max_a_whole};
     result.push_back(whole);
   }
 
@@ -1180,7 +1329,7 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
   std::sort(result.begin(), result.end(),
             [](const BBox &a, const BBox &b) { return a.min_x < b.min_x; });
 
-  CalculateSubpixelCenters(result, input, is_deep);
+  RefineSubpixelBBoxes(result, input, is_deep);
 
   return result;
 }
