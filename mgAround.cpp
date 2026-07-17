@@ -26,23 +26,22 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <fstream>
-#include <map>
-#include <mutex>
-#include <sstream>
 #include <thread>
 #include <vector>
 
-static std::mutex log_mutex;
 static AEGP_PluginID s_my_aegp_id = 0;
 
 // ---------------------------------------------------------------------
-// OPTIMIZATION #2: Debug logging is now compiled out entirely in Release
-// builds. write_log() previously opened a file and took a mutex lock on
-// every call inside the render path (once per frame when mb_enable ==
-// "Comp Setting"), which is pure overhead in production. Use MGA_LOG(x)
-// everywhere instead of calling write_log directly.
+// OPTIMIZATION #2: Debug logging is compiled out unless MGA_ENABLE_LOG
+// is defined. Opening/appending a file (+ mutex) on every FrameSetup /
+// Render / per-box refine call was a major production bottleneck and
+// could push a simple Quarter/no-MB preview into hundreds of ms or worse.
 // ---------------------------------------------------------------------
+#ifdef MGA_ENABLE_LOG
+#include <fstream>
+#include <mutex>
+#include <sstream>
+static std::mutex log_mutex;
 inline void write_log(const std::string &msg) {
   std::lock_guard<std::mutex> lock(log_mutex);
   std::ofstream f("C:\\Users\\Gusti "
@@ -54,6 +53,9 @@ inline void write_log(const std::string &msg) {
   }
 }
 #define MGA_LOG(x) write_log(x)
+#else
+#define MGA_LOG(x) ((void)0)
+#endif
 
 #ifndef min
 #define min(a, b) (((a) < (b)) ? (a) : (b))
@@ -168,6 +170,19 @@ inline BBoxDouble GetWorldContentBounds(const PF_EffectWorld *world,
   }
 }
 
+// Coarse spatial hash so GetBoxCoverage can skip most boxes per pixel
+// when Target = Character / Word (common with text animators).
+struct BoxSpatialGrid {
+  bool enabled;
+  int cols;
+  int rows;
+  double origin_x;
+  double origin_y;
+  double inv_cell_w;
+  double inv_cell_h;
+  std::vector<std::vector<int>> cells;
+};
+
 struct SampleData {
   bool has_layer_transform;
   double layer_cx;
@@ -180,6 +195,7 @@ struct SampleData {
   double sin_sample_theta;
   std::vector<BBox> boxes;
   std::vector<PrecomputedBox> precomputed; // OPTIMIZATION #1
+  BoxSpatialGrid grid;
   bool has_custom_layer;
   PF_EffectWorld custom_world;
   BBoxDouble custom_bounds;
@@ -302,6 +318,81 @@ inline void PrecomputeBoxGeometry(const std::vector<BBox> &boxes,
   }
 }
 
+// Build a uniform grid over box AABBs. Disabled for tiny box counts where
+// the linear scan is already cheaper than hashing.
+inline void BuildBoxSpatialGrid(SampleData &sample) {
+  sample.grid.enabled = false;
+  sample.grid.cols = 0;
+  sample.grid.rows = 0;
+  sample.grid.cells.clear();
+
+  const size_t n = sample.boxes.size();
+  if (n < 8 || sample.precomputed.size() != n) {
+    return;
+  }
+
+  double min_x = 1e300, max_x = -1e300, min_y = 1e300, max_y = -1e300;
+  double avg_w = 0.0, avg_h = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    const PrecomputedBox &pb = sample.precomputed[i];
+    double bx0 = pb.box_cx - pb.bound_x;
+    double bx1 = pb.box_cx + pb.bound_x;
+    double by0 = pb.box_cy - pb.bound_y;
+    double by1 = pb.box_cy + pb.bound_y;
+    if (bx0 < min_x) min_x = bx0;
+    if (bx1 > max_x) max_x = bx1;
+    if (by0 < min_y) min_y = by0;
+    if (by1 > max_y) max_y = by1;
+    avg_w += pb.bound_x * 2.0;
+    avg_h += pb.bound_y * 2.0;
+  }
+  avg_w /= (double)n;
+  avg_h /= (double)n;
+
+  double cell_w = max(8.0, avg_w);
+  double cell_h = max(8.0, avg_h);
+  double span_w = max_x - min_x;
+  double span_h = max_y - min_y;
+  if (span_w < 1.0) span_w = 1.0;
+  if (span_h < 1.0) span_h = 1.0;
+
+  int cols = (int)ceil(span_w / cell_w);
+  int rows = (int)ceil(span_h / cell_h);
+  if (cols < 1) cols = 1;
+  if (rows < 1) rows = 1;
+  // Cap grid size so build cost stays predictable.
+  if (cols > 64) cols = 64;
+  if (rows > 64) rows = 64;
+
+  sample.grid.enabled = true;
+  sample.grid.cols = cols;
+  sample.grid.rows = rows;
+  sample.grid.origin_x = min_x;
+  sample.grid.origin_y = min_y;
+  sample.grid.inv_cell_w = (double)cols / span_w;
+  sample.grid.inv_cell_h = (double)rows / span_h;
+  sample.grid.cells.assign((size_t)cols * (size_t)rows, std::vector<int>());
+
+  for (size_t i = 0; i < n; ++i) {
+    const PrecomputedBox &pb = sample.precomputed[i];
+    int c0 = (int)floor((pb.box_cx - pb.bound_x - min_x) * sample.grid.inv_cell_w);
+    int c1 = (int)floor((pb.box_cx + pb.bound_x - min_x) * sample.grid.inv_cell_w);
+    int r0 = (int)floor((pb.box_cy - pb.bound_y - min_y) * sample.grid.inv_cell_h);
+    int r1 = (int)floor((pb.box_cy + pb.bound_y - min_y) * sample.grid.inv_cell_h);
+    if (c0 < 0) c0 = 0;
+    if (r0 < 0) r0 = 0;
+    if (c1 >= cols) c1 = cols - 1;
+    if (r1 >= rows) r1 = rows - 1;
+    if (c1 < c0) c1 = c0;
+    if (r1 < r0) r1 = r0;
+    for (int r = r0; r <= r1; ++r) {
+      for (int c = c0; c <= c1; ++c) {
+        sample.grid.cells[(size_t)r * (size_t)cols + (size_t)c].push_back((int)i);
+      }
+    }
+  }
+}
+
 inline double clamped_channel(double val, double max_val) {
   if (val < 0.0)
     return 0.0;
@@ -405,39 +496,55 @@ inline double GetTextAlphaBilinear(const PF_EffectWorld *world, double x,
   }
 }
 
+// Integer nearest-neighbor alpha read used by the dilation neighborhood.
+// Much cheaper than bilinear and sufficient for max-alpha outline expansion.
+inline double GetAlphaNearest(const PF_EffectWorld *world, int x, int y,
+                              bool is_deep) {
+  if (x < 0 || y < 0 || x >= world->width || y >= world->height)
+    return 0.0;
+  void *row = (char *)world->data + y * world->rowbytes;
+  if (is_deep) {
+    return ((PF_Pixel16 *)row)[x].alpha / 32768.0;
+  }
+  return ((PF_Pixel8 *)row)[x].alpha / 255.0;
+}
+
 inline double GetMaxAlphaInNeighborhood(double ox, double oy, double rx,
                                         double ry, const PF_EffectWorld *world,
                                         bool is_deep) {
+  if (rx <= 0.001 && ry <= 0.001) {
+    return GetTextAlphaBilinear(world, ox, oy, is_deep);
+  }
+
   int rx_pixels = (int)ceil(rx);
   int ry_pixels = (int)ceil(ry);
 
-  // Check center first to enable instant short-circuiting for pixels inside the
-  // text
+  // Center keeps bilinear so the outline edge stays smooth.
   double center_a = GetTextAlphaBilinear(world, ox, oy, is_deep);
   if (center_a >= 0.999) {
     return 1.0;
   }
   double max_alpha = center_a;
 
+  const int cx = (int)floor(ox + 0.5);
+  const int cy = (int)floor(oy + 0.5);
+  const double inv_rx = 1.0 / rx;
+  const double inv_ry = 1.0 / ry;
+
   for (int dy = -ry_pixels; dy <= ry_pixels; ++dy) {
     for (int dx = -rx_pixels; dx <= rx_pixels; ++dx) {
       if (dx == 0 && dy == 0)
-        continue; // Already checked center
+        continue;
 
-      double n_x = ox + dx;
-      double n_y = oy + dy;
-      if (n_x >= 0.0 && n_x < world->width && n_y >= 0.0 &&
-          n_y < world->height) {
-        double dist_sq = (rx > 0.001 ? (dx / rx) * (dx / rx) : 0.0) +
-                         (ry > 0.001 ? (dy / ry) * (dy / ry) : 0.0);
-        if (dist_sq <= 1.0) {
-          double a = GetTextAlphaBilinear(world, n_x, n_y, is_deep);
-          if (a > max_alpha) {
-            max_alpha = a;
-            if (max_alpha >= 0.999) {
-              return 1.0; // Early return since we found maximum possible alpha
-            }
-          }
+      double dist_sq = (dx * inv_rx) * (dx * inv_rx) + (dy * inv_ry) * (dy * inv_ry);
+      if (dist_sq > 1.0)
+        continue;
+
+      double a = GetAlphaNearest(world, cx + dx, cy + dy, is_deep);
+      if (a > max_alpha) {
+        max_alpha = a;
+        if (max_alpha >= 0.999) {
+          return 1.0;
         }
       }
     }
@@ -454,7 +561,31 @@ inline void GetBoxCoverage(double x, double y, const RenderRefcon *refcon,
   double blended_g = 0.0;
   double blended_b = 0.0;
 
-  for (size_t bi = 0; bi < sample.boxes.size(); ++bi) {
+  // When repeater is off, use the spatial grid to visit only nearby boxes.
+  // Repeater expands each box across the frame, so fall back to full scan.
+  const int *candidate_indices = nullptr;
+  int candidate_count = 0;
+  bool use_index_list = false;
+
+  if (!refcon->repeater_enable && sample.grid.enabled &&
+      sample.grid.cols > 0 && sample.grid.rows > 0) {
+    int c = (int)floor((x - sample.grid.origin_x) * sample.grid.inv_cell_w);
+    int r = (int)floor((y - sample.grid.origin_y) * sample.grid.inv_cell_h);
+    if (c >= 0 && r >= 0 && c < sample.grid.cols && r < sample.grid.rows) {
+      const std::vector<int> &cell =
+          sample.grid.cells[(size_t)r * (size_t)sample.grid.cols + (size_t)c];
+      if (!cell.empty()) {
+        candidate_indices = cell.data();
+        candidate_count = (int)cell.size();
+        use_index_list = true;
+      }
+    }
+  } else {
+    candidate_count = (int)sample.boxes.size();
+  }
+
+  for (int ci = 0; ci < candidate_count; ++ci) {
+    const size_t bi = use_index_list ? (size_t)candidate_indices[ci] : (size_t)ci;
     const BBox &box = sample.boxes[bi];
     const PrecomputedBox &pb = sample.precomputed[bi];
 
@@ -674,8 +805,15 @@ inline void GetBoxCoverage(double x, double y, const RenderRefcon *refcon,
             if (refcon->mode == MGA_MODE_TEXT_OUTLINE ||
                 refcon->mode == MGA_MODE_TEXT_SOLID ||
                 refcon->mode == MGA_MODE_TEXT_BOTH) {
-              
-              double fill_a = GetMaxAlphaInNeighborhood(ox, oy, rx_dil, ry_dil, &sample.input_world, is_deep);
+              // TEXT_SOLID never needs neighborhood dilation -- skip it.
+              double fill_a = orig_a;
+              if ((refcon->mode == MGA_MODE_TEXT_OUTLINE ||
+                   refcon->mode == MGA_MODE_TEXT_BOTH) &&
+                  (rx_dil > 0.0 || ry_dil > 0.0)) {
+                fill_a = GetMaxAlphaInNeighborhood(ox, oy, rx_dil, ry_dil,
+                                                   &sample.input_world, is_deep);
+              }
+
               double solid_a = 0.0;
               if (refcon->mode == MGA_MODE_TEXT_SOLID || refcon->mode == MGA_MODE_TEXT_BOTH) {
                 solid_a = orig_a * (refcon->box_opacity / 100.0);
@@ -781,6 +919,11 @@ inline void RefineSubpixelBBoxes(std::vector<BBox> &boxes,
   }
 
   double max_val = is_deep ? 32768.0 : 255.0;
+  // Reuse profile buffers across boxes (important for per-character + animator).
+  std::vector<double> ProfileX;
+  std::vector<double> ProfileY;
+  ProfileX.reserve(64);
+  ProfileY.reserve(64);
 
   for (auto &box : boxes) {
     // Skip invalid bounding boxes
@@ -811,8 +954,8 @@ inline void RefineSubpixelBBoxes(std::vector<BBox> &boxes,
       continue;
     }
 
-    std::vector<double> ProfileX(width_range, 0.0);
-    std::vector<double> ProfileY(height_range, 0.0);
+    ProfileX.assign((size_t)width_range, 0.0);
+    ProfileY.assign((size_t)height_range, 0.0);
 
     for (int y = int_min_y; y <= int_max_y; ++y) {
       void *row = (char *)input->data + y * input->rowbytes;
@@ -942,6 +1085,7 @@ inline void RefineSubpixelBBoxes(std::vector<BBox> &boxes,
       }
     }
 
+#ifdef MGA_ENABLE_LOG
     double var_x = 0.0;
     if (sum_alpha > 0.0) {
       double sum_sq_diff = 0.0;
@@ -973,50 +1117,64 @@ inline void RefineSubpixelBBoxes(std::vector<BBox> &boxes,
       }
       MGA_LOG(ss.str());
     }
+#else
+    (void)orig_min_x;
+    (void)orig_max_x;
+    (void)orig_min_y;
+    (void)orig_max_y;
+#endif
   }
 }
 
 static PF_Err UnrotateInputWorld(PF_InData *in_data, const PF_EffectWorld *input, double theta, double cx, double cy, PF_EffectWorld *output) {
   PF_Err err = PF_Err_NONE;
+  (void)in_data;
   int width = input->width;
   int height = input->height;
   bool is_deep = PF_WORLD_IS_DEEP(input);
 
-  // Clear output to transparent
-  for (int y = 0; y < height; ++y) {
-    if (is_deep) {
-      PF_Pixel16 *row = (PF_Pixel16 *)((char *)output->data + y * output->rowbytes);
-      for (int x = 0; x < width; ++x) {
-        row[x].alpha = 0;
-        row[x].red = 0;
-        row[x].green = 0;
-        row[x].blue = 0;
-      }
-    } else {
-      PF_Pixel8 *row = (PF_Pixel8 *)((char *)output->data + y * output->rowbytes);
-      for (int x = 0; x < width; ++x) {
-        row[x].alpha = 0;
-        row[x].red = 0;
-        row[x].green = 0;
-        row[x].blue = 0;
-      }
+  // Fast path: near-zero rotation is a straight copy (no bilinear resample).
+  if (abs(theta) < 1e-6) {
+    for (int y = 0; y < height; ++y) {
+      void *src = (char *)input->data + y * input->rowbytes;
+      void *dst = (char *)output->data + y * output->rowbytes;
+      memcpy(dst, src, (size_t)input->rowbytes);
     }
+    return err;
   }
+
+  // Clear output cheaply with memset (premultiplied/straight alpha both OK as 0).
+  for (int y = 0; y < height; ++y) {
+    memset((char *)output->data + y * output->rowbytes, 0, (size_t)output->rowbytes);
+  }
+
+  // Only resample the content AABB (expanded for rotation), not the full frame.
+  BBoxDouble content = GetWorldContentBounds(input, is_deep);
+  double pad = max(content.max_x - content.min_x, content.max_y - content.min_y) * 0.5 + 4.0;
+  int x0 = (int)floor(min(content.min_x, cx - pad));
+  int x1 = (int)ceil(max(content.max_x, cx + pad));
+  int y0 = (int)floor(min(content.min_y, cy - pad));
+  int y1 = (int)ceil(max(content.max_y, cy + pad));
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 >= width) x1 = width - 1;
+  if (y1 >= height) y1 = height - 1;
 
   double cos_t = cos(theta);
   double sin_t = sin(theta);
+  const double inv_w = (width > 1) ? 1.0 / (width - 1.0) : 0.0;
+  const double inv_h = (height > 1) ? 1.0 / (height - 1.0) : 0.0;
 
-  // Fill output by sampling from input using forward rotation
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
+  for (int y = y0; y <= y1; ++y) {
+    for (int x = x0; x <= x1; ++x) {
       double dx = (double)x - cx;
       double dy = (double)y - cy;
       double rx = cx + dx * cos_t - dy * sin_t;
       double ry = cy + dx * sin_t + dy * cos_t;
 
       if (rx >= 0.0 && rx < width && ry >= 0.0 && ry < height) {
-        double u = rx / (width - 1.0);
-        double v = ry / (height - 1.0);
+        double u = rx * inv_w;
+        double v = ry * inv_h;
         double r = 0.0, g = 0.0, b = 0.0, a = 0.0;
         if (is_deep) {
           sample_bilinear<PF_Pixel16, PF_Pixel16>(input, u, v, &r, &g, &b, &a, 32768.0);
@@ -1043,6 +1201,7 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
                                   int target_mode, double word_gap_mult,
                                   double line_gap_mult) {
   std::vector<BBox> result;
+  (void)in_data;
   if (!input || !input->data) {
     return result;
   }
@@ -1052,8 +1211,7 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
 
   int g_min_x = width, g_max_x = -1;
   int g_min_y = height, g_max_y = -1;
-
-  int active_pixel_count = 0;
+  double g_max_alpha = 0.0;
 
   if (is_deep) {
     for (int y = 0; y < height; ++y) {
@@ -1061,7 +1219,6 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
           (PF_Pixel16 *)((char *)input->data + y * input->rowbytes);
       for (int x = 0; x < width; ++x) {
         if (row[x].alpha > 640) {
-          active_pixel_count++;
           if (x < g_min_x)
             g_min_x = x;
           if (x > g_max_x)
@@ -1070,6 +1227,9 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
             g_min_y = y;
           if (y > g_max_y)
             g_max_y = y;
+          double a = row[x].alpha / 32768.0;
+          if (a > g_max_alpha)
+            g_max_alpha = a;
         }
       }
     }
@@ -1078,7 +1238,6 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
       PF_Pixel8 *row = (PF_Pixel8 *)((char *)input->data + y * input->rowbytes);
       for (int x = 0; x < width; ++x) {
         if (row[x].alpha > 5) {
-          active_pixel_count++;
           if (x < g_min_x)
             g_min_x = x;
           if (x > g_max_x)
@@ -1087,6 +1246,9 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
             g_min_y = y;
           if (y > g_max_y)
             g_max_y = y;
+          double a = row[x].alpha / 255.0;
+          if (a > g_max_alpha)
+            g_max_alpha = a;
         }
       }
     }
@@ -1096,10 +1258,20 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
     return result;
   }
 
+  // Whole-layer target: one AABB is enough -- skip CCL entirely.
+  if (target_mode == MGA_TARGET_WHOLE) {
+    BBox whole = {(double)g_min_x, (double)g_max_x, (double)g_min_y,
+                  (double)g_max_y, 0.0,             0.0,
+                  g_max_alpha};
+    result.push_back(whole);
+    RefineSubpixelBBoxes(result, input, is_deep);
+    return result;
+  }
+
   int w_tb = g_max_x - g_min_x + 1;
   int h_tb = g_max_y - g_min_y + 1;
 
-  std::vector<int> labels(w_tb * h_tb, 0);
+  std::vector<int> labels((size_t)w_tb * (size_t)h_tb, 0);
   UnionFind uf(w_tb * h_tb + 10);
   int next_label = 1;
 
@@ -1117,35 +1289,41 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
       }
 
       if (active) {
-        std::vector<int> neighbors;
+        // Stack neighbors -- avoid per-pixel heap allocation in CCL.
+        int neighbors[4];
+        int ncount = 0;
         if (x > 0 && labels[y * w_tb + x - 1] > 0)
-          neighbors.push_back(labels[y * w_tb + x - 1]);
+          neighbors[ncount++] = labels[y * w_tb + x - 1];
         if (x > 0 && y > 0 && labels[(y - 1) * w_tb + x - 1] > 0)
-          neighbors.push_back(labels[(y - 1) * w_tb + x - 1]);
+          neighbors[ncount++] = labels[(y - 1) * w_tb + x - 1];
         if (y > 0 && labels[(y - 1) * w_tb + x] > 0)
-          neighbors.push_back(labels[(y - 1) * w_tb + x]);
+          neighbors[ncount++] = labels[(y - 1) * w_tb + x];
         if (x < w_tb - 1 && y > 0 && labels[(y - 1) * w_tb + x + 1] > 0)
-          neighbors.push_back(labels[(y - 1) * w_tb + x + 1]);
+          neighbors[ncount++] = labels[(y - 1) * w_tb + x + 1];
 
-        if (neighbors.empty()) {
+        if (ncount == 0) {
           labels[y * w_tb + x] = next_label;
           next_label++;
         } else {
           int min_l = neighbors[0];
-          for (int n : neighbors) {
-            if (n < min_l)
-              min_l = n;
+          for (int ni = 1; ni < ncount; ++ni) {
+            if (neighbors[ni] < min_l)
+              min_l = neighbors[ni];
           }
           labels[y * w_tb + x] = min_l;
-          for (int n : neighbors) {
-            uf.unite(min_l, n);
+          for (int ni = 0; ni < ncount; ++ni) {
+            uf.unite(min_l, neighbors[ni]);
           }
         }
       }
     }
   }
 
-  std::map<int, BBox> label_bboxes;
+  // Flat remapping instead of std::map (log n per active pixel).
+  std::vector<int> root_to_box(next_label + 1, -1);
+  std::vector<BBox> boxes;
+  boxes.reserve(64);
+
   for (int y = 0; y < h_tb; ++y) {
     int img_y = g_min_y + y;
     void *row_ptr = (char *)input->data + img_y * input->rowbytes;
@@ -1163,11 +1341,14 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
           alpha_val = ((PF_Pixel8 *)row_ptr)[px].alpha / 255.0;
         }
 
-        if (label_bboxes.find(root_l) == label_bboxes.end()) {
-          BBox box = {(double)px, (double)px, (double)py, (double)py, 0.0, 0.0, alpha_val};
-          label_bboxes[root_l] = box;
+        int bi = root_to_box[root_l];
+        if (bi < 0) {
+          root_to_box[root_l] = (int)boxes.size();
+          BBox box = {(double)px, (double)px, (double)py, (double)py,
+                      0.0,        0.0,        alpha_val};
+          boxes.push_back(box);
         } else {
-          BBox &box = label_bboxes[root_l];
+          BBox &box = boxes[(size_t)bi];
           if ((double)px < box.min_x)
             box.min_x = (double)px;
           if ((double)px > box.max_x)
@@ -1183,18 +1364,21 @@ std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
     }
   }
 
-  std::vector<BBox> boxes;
-  for (const auto &pair : label_bboxes) {
-    const BBox &box = pair.second;
-    int bw = (int)round(box.max_x - box.min_x + 1.0);
-    int bh = (int)round(box.max_y - box.min_y + 1.0);
-    if (bw <= 1 && bh <= 1) {
-      continue; // Ignore 1x1 noise components
+  {
+    std::vector<BBox> filtered;
+    filtered.reserve(boxes.size());
+    for (const auto &box : boxes) {
+      int bw = (int)round(box.max_x - box.min_x + 1.0);
+      int bh = (int)round(box.max_y - box.min_y + 1.0);
+      if (bw <= 1 && bh <= 1) {
+        continue; // Ignore 1x1 noise components
+      }
+      if (bw <= 2 && bh <= 2 && box.max_alpha < 0.1) {
+        continue; // Ignore tiny faint noise components
+      }
+      filtered.push_back(box);
     }
-    if (bw <= 2 && bh <= 2 && box.max_alpha < 0.1) {
-      continue; // Ignore tiny faint noise components
-    }
-    boxes.push_back(box);
+    boxes.swap(filtered);
   }
 
   if (boxes.empty())
@@ -2032,23 +2216,43 @@ static PF_Err CallIterate(PF_InData *in_data, A_long linesL,
                           PF_EffectWorld *src, void *rc, PF_LayerDef *output,
                           bool is_deep) {
   PF_Err err = PF_Err_NONE;
+  (void)in_data;
+  (void)linesL;
   int width = output->width;
   int height = output->height;
 
-  unsigned int num_threads = std::thread::hardware_concurrency();
-  if (num_threads == 0)
-    num_threads = 4;
+  RenderRefcon *rc_cast = (RenderRefcon *)rc;
+  int r_min_y = (int)floor(rc_cast->render_min_y);
+  int r_max_y = (int)ceil(rc_cast->render_max_y);
+  if (r_min_y < 0) r_min_y = 0;
+  if (r_max_y >= height) r_max_y = height - 1;
+  int roi_h = (r_max_y >= r_min_y) ? (r_max_y - r_min_y + 1) : 0;
+
+  // Thread spawn overhead dominates tiny Quarter ROIs; keep those single-thread.
+  unsigned int num_threads = 1;
+  if (roi_h >= 64) {
+    num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0)
+      num_threads = 4;
+    if (num_threads > (unsigned int)roi_h)
+      num_threads = (unsigned int)roi_h;
+  }
+
+  if (num_threads <= 1) {
+    RenderChunk(0, height, width, height, src, output, rc, is_deep);
+    return err;
+  }
 
   std::vector<std::thread> threads;
   threads.reserve(num_threads);
 
-  int chunk_size = height / num_threads;
+  int chunk_size = height / (int)num_threads;
   if (chunk_size == 0)
     chunk_size = 1;
 
   for (unsigned int i = 0; i < num_threads; ++i) {
-    int start_y = i * chunk_size;
-    int end_y = (i == num_threads - 1) ? height : (i + 1) * chunk_size;
+    int start_y = (int)i * chunk_size;
+    int end_y = (i == num_threads - 1) ? height : ((int)i + 1) * chunk_size;
     if (start_y < end_y) {
       threads.emplace_back(RenderChunk, start_y, end_y, width, height, src,
                            output, rc, is_deep);
@@ -2070,23 +2274,50 @@ static void SumTextAnimatorRotations(
     const A_Time *t,
     double *accum_rotation_rad) {
   A_long num_streams = 0;
-  if (suites.DynamicStreamSuite4() && suites.DynamicStreamSuite4()->AEGP_GetNumStreamsInGroup(parent_group, &num_streams) == A_Err_NONE && num_streams > 0) {
+  if (suites.DynamicStreamSuite4() &&
+      suites.DynamicStreamSuite4()->AEGP_GetNumStreamsInGroup(
+          parent_group, &num_streams) == A_Err_NONE &&
+      num_streams > 0) {
     for (A_long i = 0; i < num_streams; ++i) {
       AEGP_StreamRefH streamH = NULL;
-      if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefByIndex(s_my_aegp_id, parent_group, i, &streamH) == A_Err_NONE && streamH) {
+      if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefByIndex(
+              s_my_aegp_id, parent_group, i, &streamH) == A_Err_NONE &&
+          streamH) {
         AEGP_StreamGroupingType grouping_type = AEGP_StreamGroupingType_NONE;
-        suites.DynamicStreamSuite4()->AEGP_GetStreamGroupingType(streamH, &grouping_type);
-        
-        if (grouping_type == AEGP_StreamGroupingType_NAMED_GROUP || grouping_type == AEGP_StreamGroupingType_INDEXED_GROUP) {
-          SumTextAnimatorRotations(suites, streamH, t, accum_rotation_rad);
+        suites.DynamicStreamSuite4()->AEGP_GetStreamGroupingType(
+            streamH, &grouping_type);
+
+        if (grouping_type == AEGP_StreamGroupingType_NAMED_GROUP ||
+            grouping_type == AEGP_StreamGroupingType_INDEXED_GROUP) {
+          // Skip selector / path / document branches -- rotation only lives
+          // under animator property groups.
+          char match_name[AEGP_MAX_STREAM_MATCH_NAME_SIZE] = {0};
+          bool descend = true;
+          if (suites.DynamicStreamSuite4()->AEGP_GetMatchName(
+                  streamH, match_name) == A_Err_NONE) {
+            if (strcmp(match_name, "ADBE Text Selector") == 0 ||
+                strcmp(match_name, "ADBE Text Path Options") == 0 ||
+                strcmp(match_name, "ADBE Text More Options") == 0 ||
+                strcmp(match_name, "ADBE Text Document") == 0 ||
+                strcmp(match_name, "ADBE Text Selectors") == 0) {
+              descend = false;
+            }
+          }
+          if (descend) {
+            SumTextAnimatorRotations(suites, streamH, t, accum_rotation_rad);
+          }
         } else if (grouping_type == AEGP_StreamGroupingType_LEAF) {
           char match_name[AEGP_MAX_STREAM_MATCH_NAME_SIZE] = {0};
-          if (suites.DynamicStreamSuite4()->AEGP_GetMatchName(streamH, match_name) == A_Err_NONE) {
+          if (suites.DynamicStreamSuite4()->AEGP_GetMatchName(
+                  streamH, match_name) == A_Err_NONE) {
             if (strcmp(match_name, "ADBE Text Rotation") == 0) {
               AEGP_StreamValue2 val;
               AEFX_CLR_STRUCT(val);
-              if (suites.StreamSuite5()->AEGP_GetNewStreamValue(s_my_aegp_id, streamH, AEGP_LTimeMode_CompTime, t, TRUE, &val) == A_Err_NONE) {
-                *accum_rotation_rad += val.val.one_d * (3.14159265358979323846 / 180.0);
+              if (suites.StreamSuite5()->AEGP_GetNewStreamValue(
+                      s_my_aegp_id, streamH, AEGP_LTimeMode_CompTime, t, TRUE,
+                      &val) == A_Err_NONE) {
+                *accum_rotation_rad +=
+                    val.val.one_d * (3.14159265358979323846 / 180.0);
                 suites.StreamSuite5()->AEGP_DisposeStreamValue(&val);
               }
             }
@@ -2098,22 +2329,43 @@ static void SumTextAnimatorRotations(
   }
 }
 
-static double GetTextLayerAnimatorRotation(
-    AEGP_SuiteHandler &suites,
-    AEGP_LayerH layerH,
-    const A_Time *t) {
+static double GetTextLayerAnimatorRotation(AEGP_SuiteHandler &suites,
+                                           AEGP_LayerH layerH,
+                                           const A_Time *t) {
   double accum_rotation_rad = 0.0;
-  if (suites.DynamicStreamSuite4()) {
-    AEGP_StreamRefH root_streamH = NULL;
-    if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefForLayer(s_my_aegp_id, layerH, &root_streamH) == A_Err_NONE && root_streamH) {
-      AEGP_StreamRefH text_prop_groupH = NULL;
-      if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefByMatchname(s_my_aegp_id, root_streamH, "ADBE Text Properties", &text_prop_groupH) == A_Err_NONE && text_prop_groupH) {
-        SumTextAnimatorRotations(suites, text_prop_groupH, t, &accum_rotation_rad);
-        suites.StreamSuite5()->AEGP_DisposeStream(text_prop_groupH);
-      }
-      suites.StreamSuite5()->AEGP_DisposeStream(root_streamH);
-    }
+  if (!suites.DynamicStreamSuite4()) {
+    return accum_rotation_rad;
   }
+
+  AEGP_StreamRefH root_streamH = NULL;
+  if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefForLayer(
+          s_my_aegp_id, layerH, &root_streamH) != A_Err_NONE ||
+      !root_streamH) {
+    return accum_rotation_rad;
+  }
+
+  // Jump straight to Animators when present -- avoids walking Document /
+  // Path Options / More Options on every frame.
+  AEGP_StreamRefH text_prop_groupH = NULL;
+  if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefByMatchname(
+          s_my_aegp_id, root_streamH, "ADBE Text Properties",
+          &text_prop_groupH) == A_Err_NONE &&
+      text_prop_groupH) {
+    AEGP_StreamRefH animatorsH = NULL;
+    if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefByMatchname(
+            s_my_aegp_id, text_prop_groupH, "ADBE Text Animators",
+            &animatorsH) == A_Err_NONE &&
+        animatorsH) {
+      SumTextAnimatorRotations(suites, animatorsH, t, &accum_rotation_rad);
+      suites.StreamSuite5()->AEGP_DisposeStream(animatorsH);
+    } else {
+      // Fallback for hosts/layouts without the Animators group match name.
+      SumTextAnimatorRotations(suites, text_prop_groupH, t,
+                               &accum_rotation_rad);
+    }
+    suites.StreamSuite5()->AEGP_DisposeStream(text_prop_groupH);
+  }
+  suites.StreamSuite5()->AEGP_DisposeStream(root_streamH);
   return accum_rotation_rad;
 }
 
@@ -2673,7 +2925,26 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
 
   double main_rotation = layer_rotation_rad;
   double main_anim_rot = 0.0;
-  if (is_text && layerH) {
+  // Prefer the animator rotation already gathered in FrameSetup -- the
+  // dynamic-stream walk is expensive and was previously repeated every Render.
+  if (fd && !fd->samples.empty()) {
+    int current_sample_idx = 0;
+    if (do_mb && effective_samples > 1) {
+      for (size_t i = 0; i < sample_times.size() && i < fd->samples.size();
+           ++i) {
+        if (sample_times[i] == in_data->current_time) {
+          current_sample_idx = (int)i;
+          break;
+        }
+      }
+    }
+    if (current_sample_idx >= 0 &&
+        current_sample_idx < (int)fd->samples.size()) {
+      main_anim_rot = fd->samples[current_sample_idx].animator_rotation_rad;
+    } else {
+      main_anim_rot = fd->samples[0].animator_rotation_rad;
+    }
+  } else if (is_text && layerH) {
     A_Time t = {in_data->current_time, in_data->time_scale};
     A_Time comp_time = t;
     if (suites.LayerSuite8()) {
@@ -2685,16 +2956,30 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
 
   PF_EffectWorld *input_world = &params[MGA_INPUT]->u.ld;
 
-  if (has_layer_transform) {
-    A_Err new_world_err = in_data->utils->new_world(in_data->effect_ref, input_world->width, input_world->height, PF_NewWorldFlag_NONE, &main_temp_world);
+  // Text layers always report a layer transform, but Position/Opacity/Tracking
+  // animators leave rotation at ~0. Skip the temp-world unrotate in that case
+  // -- it was a full-frame cost even at Quarter with MB off.
+  const bool needs_unrotate =
+      has_layer_transform && abs(main_total_rotation) > 1e-6;
+
+  if (needs_unrotate) {
+    A_Err new_world_err = in_data->utils->new_world(
+        in_data->effect_ref, input_world->width, input_world->height,
+        PF_NewWorldFlag_NONE, &main_temp_world);
     if (new_world_err == PF_Err_NONE) {
-      UnrotateInputWorld(in_data, input_world, main_total_rotation, layer_cx, layer_cy, &main_temp_world);
-      local_boxes = FindTargetBoxes(in_data, &main_temp_world, target, word_gap, line_gap);
+      UnrotateInputWorld(in_data, input_world, main_total_rotation, layer_cx,
+                         layer_cy, &main_temp_world);
+      local_boxes =
+          FindTargetBoxes(in_data, &main_temp_world, target, word_gap, line_gap);
       has_main_temp_world = true;
       temp_worlds.push_back(main_temp_world);
+    } else {
+      local_boxes =
+          FindTargetBoxes(in_data, input_world, target, word_gap, line_gap);
     }
   } else {
-    local_boxes = FindTargetBoxes(in_data, input_world, target, word_gap, line_gap);
+    local_boxes =
+        FindTargetBoxes(in_data, input_world, target, word_gap, line_gap);
   }
 
   for (int i = 0; i < rc.num_samples; ++i) {
@@ -2832,7 +3117,12 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
   // CallIterate() below, which previously recomputed this same math on
   // every single pixel.
   for (int i = 0; i < rc.num_samples; ++i) {
-    PrecomputeBoxGeometry(rc.samples[i].boxes, &rc, rc.samples[i].cos_sample_theta, rc.samples[i].sin_sample_theta, rc.samples[i].precomputed);
+    PrecomputeBoxGeometry(rc.samples[i].boxes, &rc,
+                          rc.samples[i].cos_sample_theta,
+                          rc.samples[i].sin_sample_theta,
+                          rc.samples[i].precomputed);
+    // Spatial hash for per-character / per-word text animator cases.
+    BuildBoxSpatialGrid(rc.samples[i]);
   }
 
   // Exact rotated bounding box calculation
