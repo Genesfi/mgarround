@@ -169,6 +169,15 @@ inline BBoxDouble GetWorldContentBounds(const PF_EffectWorld *world,
 }
 
 struct SampleData {
+  bool has_layer_transform;
+  double layer_cx;
+  double layer_cy;
+  double cos_total_theta;
+  double sin_total_theta;
+  double animator_rotation;
+  double sample_theta;
+  double cos_sample_theta;
+  double sin_sample_theta;
   std::vector<BBox> boxes;
   std::vector<PrecomputedBox> precomputed; // OPTIMIZATION #1
   bool has_custom_layer;
@@ -215,16 +224,41 @@ struct RenderRefcon {
   double render_max_x;
   double render_min_y;
   double render_max_y;
+
+  bool repeater_enable;
+  int repeater_count_l;
+  int repeater_count_r;
+  int repeater_count_u;
+  int repeater_count_d;
+  double repeater_gap_x;
+  double repeater_gap_y;
+  double repeater_offset_x;
+  double repeater_offset_y;
+  bool repeater_show_text;
+  bool repeater_show_shape;
+  double global_cx;
+  double global_cy;
+  double repeater_trans_x;
+  double repeater_trans_y;
+  double repeater_trans_cos;
+  double repeater_trans_sin;
+  bool has_layer_transform;
+  double layer_cx;
+  double layer_cy;
+  double total_theta;
+  double cos_total_theta;
+  double sin_total_theta;
 };
 
-// Definition of PrecomputeBoxGeometry now that RenderRefcon is complete.
 inline void PrecomputeBoxGeometry(const std::vector<BBox> &boxes,
                                   const RenderRefcon *refcon,
+                                  double cos_t_param,
+                                  double sin_t_param,
                                   std::vector<PrecomputedBox> &out) {
   out.resize(boxes.size());
 
-  double cos_t = abs(refcon->cos_theta);
-  double sin_t = abs(refcon->sin_theta);
+  double cos_t = abs(cos_t_param);
+  double sin_t = abs(sin_t_param);
 
   for (size_t i = 0; i < boxes.size(); ++i) {
     const BBox &box = boxes[i];
@@ -325,6 +359,10 @@ inline void sample_bilinear(const PF_EffectWorld *world, double u, double v,
 template <typename T>
 inline double GetAlphaAt(const PF_EffectWorld *world, double x, double y,
                          double max_val) {
+  // Return 0 for out-of-bounds coordinates instead of clamping to edge pixels
+  if (x < -0.5 || x > world->width - 0.5 || y < -0.5 || y > world->height - 0.5)
+    return 0.0;
+
   if (x < 0)
     x = 0;
   if (x > world->width - 1)
@@ -420,8 +458,6 @@ inline void GetBoxCoverage(double x, double y, const RenderRefcon *refcon,
     const BBox &box = sample.boxes[bi];
     const PrecomputedBox &pb = sample.precomputed[bi];
 
-    // OPTIMIZATION #1: these used to be recomputed per pixel; now read
-    // from the precomputed struct filled once per box before rendering.
     double box_cx = pb.box_cx;
     double box_cy = pb.box_cy;
     double box_w = pb.box_w;
@@ -430,291 +466,312 @@ inline void GetBoxCoverage(double x, double y, const RenderRefcon *refcon,
     if (box_w <= 0.0 || box_h <= 0.0)
       continue;
 
-    double dx = x - box_cx;
-    double dy = y - box_cy;
+    int start_col = refcon->repeater_enable ? -refcon->repeater_count_l : 0;
+    int end_col = refcon->repeater_enable ? refcon->repeater_count_r : 0;
+    int start_row = refcon->repeater_enable ? -refcon->repeater_count_u : 0;
+    int end_row = refcon->repeater_enable ? refcon->repeater_count_d : 0;
 
-    // Tight rotated bounding-box check
-    double half_w = pb.half_w;
-    double half_h = pb.half_h;
-    double clamped_r = pb.clamped_r;
-    double bound_x = pb.bound_x;
-    double bound_y = pb.bound_y;
+    for (int row = start_row; row <= end_row; ++row) {
+      for (int col = start_col; col <= end_col; ++col) {
+        // Repeated center coordinates
+        double box_cx_rep = pb.box_cx + col * (pb.box_w + refcon->repeater_gap_x) + row * refcon->repeater_offset_x;
+        double box_cy_rep = pb.box_cy + row * (pb.box_h + refcon->repeater_gap_y) + col * refcon->repeater_offset_y;
 
-    if (abs(dx) > bound_x || abs(dy) > bound_y) {
-      continue;
-    }
+        double dx = x - box_cx_rep;
+        double dy = y - box_cy_rep;
 
-    // Rotate point
-    double rx = dx * refcon->cos_theta - dy * refcon->sin_theta;
-    double ry = dx * refcon->sin_theta + dy * refcon->cos_theta;
+        // Tight rotated bounding-box check
+        double half_w = pb.half_w;
+        double half_h = pb.half_h;
+        double clamped_r = pb.clamped_r;
+        double bound_x = pb.bound_x;
+        double bound_y = pb.bound_y;
 
-    double px_local = abs(rx);
-    double py_local = abs(ry);
-
-    double qx = px_local - (half_w - clamped_r);
-    double qy = py_local - (half_h - clamped_r);
-
-    double val_x = qx > 0.0 ? qx : 0.0;
-    double val_y = qy > 0.0 ? qy : 0.0;
-    double corner_dist = sqrt(val_x * val_x + val_y * val_y);
-
-    double max_q = qx > qy ? qx : qy;
-    double inside_dist = max_q < 0.0 ? max_q : 0.0;
-
-    double dist = corner_dist + inside_dist - clamped_r;
-
-    double current_alpha = 0.0;
-    double cur_r = 0.0, cur_g = 0.0, cur_b = 0.0;
-
-    if (refcon->mode == MGA_MODE_TEXT_OUTLINE ||
-        refcon->mode == MGA_MODE_TEXT_SOLID ||
-        refcon->mode == MGA_MODE_TEXT_BOTH) {
-      double rx_dil =
-          (refcon->mode == MGA_MODE_TEXT_SOLID)
-              ? 0.0
-              : (refcon->render_stroke_width / (refcon->scale_x_pct / 100.0));
-      double ry_dil =
-          (refcon->mode == MGA_MODE_TEXT_SOLID)
-              ? 0.0
-              : (refcon->render_stroke_width / (refcon->scale_y_pct / 100.0));
-
-      // IMPORTANT: use the box's stable geometric center here, NOT
-      // box.cx/box.cy (the alpha-weighted subpixel centroid from
-      // CalculateSubpixelCenters). The centroid shifts slightly frame to
-      // frame with antialiasing, which made the outline sample point
-      // jitter and caused visible flicker. box_cx/box_cy already have
-      // render_offset applied (see PrecomputeBoxGeometry), so subtract it
-      // back out to recover the original un-offset center.
-      double cx_geom = box_cx - refcon->render_offset_x;
-      double cy_geom = box_cy - refcon->render_offset_y;
-
-      double cos_t = refcon->cos_theta;
-      double sin_t = -refcon->sin_theta;
-
-      double dx_local = rx / (refcon->scale_x_pct / 100.0);
-      double dy_local = ry / (refcon->scale_y_pct / 100.0);
-
-      double ux = dx_local * cos_t - dy_local * (-sin_t);
-      double uy = dx_local * (-sin_t) + dy_local * cos_t;
-
-      double ox = cx_geom + ux;
-      double oy = cy_geom + uy;
-
-      if (ox < box.min_x - rx_dil - 4.0 || ox > box.max_x + rx_dil + 4.0 ||
-          oy < box.min_y - ry_dil - 4.0 || oy > box.max_y + ry_dil + 4.0) {
-        continue;
-      }
-
-      double fill_a = GetMaxAlphaInNeighborhood(ox, oy, rx_dil, ry_dil,
-                                                &sample.input_world, is_deep);
-      double orig_a =
-          GetTextAlphaBilinear(&sample.input_world, ox, oy, is_deep);
-
-      double solid_a = 0.0;
-      if (refcon->mode == MGA_MODE_TEXT_SOLID ||
-          refcon->mode == MGA_MODE_TEXT_BOTH) {
-        solid_a = orig_a * (refcon->box_opacity / 100.0);
-      }
-
-      double outline_a = 0.0;
-      if (refcon->mode == MGA_MODE_TEXT_OUTLINE ||
-          refcon->mode == MGA_MODE_TEXT_BOTH) {
-        double diff = fill_a - orig_a;
-        if (diff < 0.0)
-          diff = 0.0;
-        outline_a = diff * (refcon->outline_opacity / 100.0);
-      }
-
-      if (refcon->mode == MGA_MODE_TEXT_BOTH) {
-        current_alpha = outline_a + solid_a * (1.0 - outline_a);
-        if (current_alpha > 0.0) {
-          double outline_r = refcon->outline_color.red / 255.0;
-          double outline_g = refcon->outline_color.green / 255.0;
-          double outline_b = refcon->outline_color.blue / 255.0;
-
-          double solid_r = refcon->box_color.red / 255.0;
-          double solid_g = refcon->box_color.green / 255.0;
-          double solid_b = refcon->box_color.blue / 255.0;
-
-          cur_r =
-              (outline_r * outline_a + solid_r * solid_a * (1.0 - outline_a)) /
-              current_alpha;
-          cur_g =
-              (outline_g * outline_a + solid_g * solid_a * (1.0 - outline_a)) /
-              current_alpha;
-          cur_b =
-              (outline_b * outline_a + solid_b * solid_a * (1.0 - outline_a)) /
-              current_alpha;
+        if (abs(dx) > bound_x || abs(dy) > bound_y) {
+          continue;
         }
-      } else if (refcon->mode == MGA_MODE_TEXT_OUTLINE) {
-        if (refcon->fill_outline) {
-          double u_world = ox / (sample.input_world.width - 1.0);
-          double v_world = oy / (sample.input_world.height - 1.0);
-          double smp_r = 0.0, smp_g = 0.0, smp_b = 0.0, smp_a = 0.0;
-          double max_val = is_deep ? 32768.0 : 255.0;
-          if (is_deep) {
-            sample_bilinear<PF_Pixel16, PF_Pixel16>(
-                &sample.input_world, u_world, v_world, &smp_r, &smp_g, &smp_b,
-                &smp_a, max_val);
+
+        // Rotate point
+        double rx = dx * sample.cos_sample_theta - dy * sample.sin_sample_theta;
+        double ry = dx * sample.sin_sample_theta + dy * sample.cos_sample_theta;
+
+        double px_local = abs(rx);
+        double py_local = abs(ry);
+
+        double qx = px_local - (half_w - clamped_r);
+        double qy = py_local - (half_h - clamped_r);
+
+        double val_x = qx > 0.0 ? qx : 0.0;
+        double val_y = qy > 0.0 ? qy : 0.0;
+        double corner_dist = sqrt(val_x * val_x + val_y * val_y);
+
+        double max_q = qx > qy ? qx : qy;
+        double inside_dist = max_q < 0.0 ? max_q : 0.0;
+
+        double dist = corner_dist + inside_dist - clamped_r;
+
+        // If repeater is enabled, we use show_text / show_shape.
+        // If repeater is disabled, we do not draw text inside GetBoxCoverage
+        // for box modes, because the original text is already drawn at its
+        // unshifted position (or not drawn at all in Boxes Only mode).
+        // We only draw it for text modes where the text itself is the shape.
+        bool show_text = true;
+        if (refcon->repeater_enable) {
+          show_text = refcon->repeater_show_text;
+        } else {
+          bool is_text_mode = (refcon->mode == MGA_MODE_TEXT_OUTLINE ||
+                               refcon->mode == MGA_MODE_TEXT_SOLID ||
+                               refcon->mode == MGA_MODE_TEXT_BOTH);
+          show_text = is_text_mode;
+        }
+        bool show_shape = refcon->repeater_enable ? refcon->repeater_show_shape : true;
+
+        if (!show_text && !show_shape) {
+          continue;
+        }
+
+        double shape_a = 0.0;
+        double shape_r = 0.0, shape_g = 0.0, shape_b = 0.0;
+
+        // Calculate Shape Box Coverage
+        if (show_shape) {
+          if (refcon->mode == MGA_MODE_CUSTOM_LAYER && sample.has_custom_layer) {
+            double bounds_w = sample.custom_bounds.max_x - sample.custom_bounds.min_x + 1.0;
+            double bounds_h = sample.custom_bounds.max_y - sample.custom_bounds.min_y + 1.0;
+            if (bounds_w < 1.0) bounds_w = 1.0;
+            if (bounds_h < 1.0) bounds_h = 1.0;
+
+            double aspect_custom = bounds_w / bounds_h;
+            double sprite_w = box_w;
+            double sprite_h = box_h;
+
+            if (refcon->keep_aspect) {
+              double aspect_box = box_w / box_h;
+              if (aspect_custom > aspect_box) {
+                sprite_w = box_w;
+                sprite_h = box_w / aspect_custom;
+              } else {
+                sprite_h = box_h;
+                sprite_w = box_h * aspect_custom;
+              }
+            }
+
+            double u_content = (rx / sprite_w) + 0.5;
+            double v_content = (ry / sprite_h) + 0.5;
+
+            if (u_content >= 0.0 && u_content <= 1.0 && v_content >= 0.0 && v_content <= 1.0) {
+              double pixel_x = sample.custom_bounds.min_x + u_content * (bounds_w - 1.0);
+              double pixel_y = sample.custom_bounds.min_y + v_content * (bounds_h - 1.0);
+
+              double u_world = pixel_x / (sample.custom_world.width - 1.0);
+              double v_world = pixel_y / (sample.custom_world.height - 1.0);
+
+              double smp_r = 0.0, smp_g = 0.0, smp_b = 0.0, smp_a = 0.0;
+              double max_val = is_deep ? 32768.0 : 255.0;
+              if (is_deep) {
+                sample_bilinear<PF_Pixel16, PF_Pixel16>(&sample.custom_world, u_world, v_world, &smp_r, &smp_g, &smp_b, &smp_a, max_val);
+              } else {
+                sample_bilinear<PF_Pixel8, PF_Pixel8>(&sample.custom_world, u_world, v_world, &smp_r, &smp_g, &smp_b, &smp_a, max_val);
+              }
+
+              double mask_a = (dist < 0.5) ? (dist < -0.5 ? 1.0 : (0.5 - dist)) : 0.0;
+              smp_a *= mask_a;
+
+              shape_a = smp_a * (refcon->box_opacity / 100.0) * box.max_alpha;
+              shape_r = smp_r;
+              shape_g = smp_g;
+              shape_b = smp_b;
+            }
           } else {
-            sample_bilinear<PF_Pixel8, PF_Pixel8>(&sample.input_world, u_world,
-                                                  v_world, &smp_r, &smp_g,
-                                                  &smp_b, &smp_a, max_val);
+            double solid_a = 0.0;
+            if (refcon->mode == MGA_MODE_SOLID || refcon->mode == MGA_MODE_BOTH) {
+              solid_a = (dist < 0.5) ? (dist < -0.5 ? 1.0 : (0.5 - dist)) : 0.0;
+              solid_a *= (refcon->box_opacity / 100.0) * box.max_alpha;
+            }
+
+            double outline_a = 0.0;
+            if (refcon->mode == MGA_MODE_OUTLINE || refcon->mode == MGA_MODE_BOTH) {
+              double outline_dist = abs(dist) - (refcon->render_stroke_width / 2.0);
+              outline_a = (outline_dist < 0.5) ? (outline_dist < -0.5 ? 1.0 : (0.5 - outline_dist)) : 0.0;
+              outline_a *= (refcon->outline_opacity / 100.0) * box.max_alpha;
+            }
+
+            if (refcon->mode == MGA_MODE_BOTH) {
+              shape_a = outline_a + solid_a * (1.0 - outline_a);
+              if (shape_a > 0.0) {
+                double outline_r = refcon->outline_color.red / 255.0;
+                double outline_g = refcon->outline_color.green / 255.0;
+                double outline_b = refcon->outline_color.blue / 255.0;
+
+                double solid_r = refcon->box_color.red / 255.0;
+                double solid_g = refcon->box_color.green / 255.0;
+                double solid_b = refcon->box_color.blue / 255.0;
+
+                shape_r = (outline_r * outline_a + solid_r * solid_a * (1.0 - outline_a)) / shape_a;
+                shape_g = (outline_g * outline_a + solid_g * solid_a * (1.0 - outline_a)) / shape_a;
+                shape_b = (outline_b * outline_a + solid_b * solid_a * (1.0 - outline_a)) / shape_a;
+              }
+            } else if (refcon->mode == MGA_MODE_OUTLINE) {
+              shape_a = outline_a;
+              shape_r = refcon->outline_color.red / 255.0;
+              shape_g = refcon->outline_color.green / 255.0;
+              shape_b = refcon->outline_color.blue / 255.0;
+            } else {
+              shape_a = solid_a;
+              shape_r = refcon->box_color.red / 255.0;
+              shape_g = refcon->box_color.green / 255.0;
+              shape_b = refcon->box_color.blue / 255.0;
+            }
+          }
+        }
+
+        double text_a = 0.0;
+        double text_r = 0.0, text_g = 0.0, text_b = 0.0;
+
+        // Calculate Text Coverage
+        if (show_text) {
+          double cx_geom = box_cx - refcon->render_offset_x;
+          double cy_geom = box_cy - refcon->render_offset_y;
+
+          double dx_local = rx / (refcon->scale_x_pct / 100.0);
+          double dy_local = ry / (refcon->scale_y_pct / 100.0);
+          double ux = dx_local;
+          double uy = dy_local;
+
+          double ox = cx_geom + ux;
+          double oy = cy_geom + uy;
+
+
+
+          double rx_dil = 0.0;
+          double ry_dil = 0.0;
+          if (refcon->mode == MGA_MODE_TEXT_OUTLINE || refcon->mode == MGA_MODE_TEXT_BOTH) {
+            rx_dil = refcon->render_stroke_width / (refcon->scale_x_pct / 100.0);
+            ry_dil = refcon->render_stroke_width / (refcon->scale_y_pct / 100.0);
           }
 
-          current_alpha = outline_a + smp_a * (1.0 - outline_a);
-          if (current_alpha > 0.0) {
-            double outline_r = refcon->outline_color.red / 255.0;
-            double outline_g = refcon->outline_color.green / 255.0;
-            double outline_b = refcon->outline_color.blue / 255.0;
+          if (ox >= box.min_x - rx_dil - 4.0 && ox <= box.max_x + rx_dil + 4.0 &&
+              oy >= box.min_y - ry_dil - 4.0 && oy <= box.max_y + ry_dil + 4.0) {
 
-            cur_r =
-                (outline_r * outline_a + smp_r * smp_a * (1.0 - outline_a)) /
-                current_alpha;
-            cur_g =
-                (outline_g * outline_a + smp_g * smp_a * (1.0 - outline_a)) /
-                current_alpha;
-            cur_b =
-                (outline_b * outline_a + smp_b * smp_a * (1.0 - outline_a)) /
-                current_alpha;
+            double orig_r = 0.0, orig_g = 0.0, orig_b = 0.0, orig_a = 0.0;
+            double max_val = is_deep ? 32768.0 : 255.0;
+
+            // Bounds check: if ox/oy is outside the input world buffer,
+            // return transparent instead of clamping to edge pixels.
+            // This prevents text corruption when the layer is moved
+            // partially off-screen or during repeater offset calculations.
+            if (ox >= 0.0 && ox < sample.input_world.width &&
+                oy >= 0.0 && oy < sample.input_world.height) {
+              double u_world = ox / (sample.input_world.width - 1.0);
+              double v_world = oy / (sample.input_world.height - 1.0);
+              if (is_deep) {
+                sample_bilinear<PF_Pixel16, PF_Pixel16>(&sample.input_world, u_world, v_world, &orig_r, &orig_g, &orig_b, &orig_a, max_val);
+              } else {
+                sample_bilinear<PF_Pixel8, PF_Pixel8>(&sample.input_world, u_world, v_world, &orig_r, &orig_g, &orig_b, &orig_a, max_val);
+              }
+            }
+
+            if (refcon->mode == MGA_MODE_TEXT_OUTLINE ||
+                refcon->mode == MGA_MODE_TEXT_SOLID ||
+                refcon->mode == MGA_MODE_TEXT_BOTH) {
+              
+              double fill_a = GetMaxAlphaInNeighborhood(ox, oy, rx_dil, ry_dil, &sample.input_world, is_deep);
+              double solid_a = 0.0;
+              if (refcon->mode == MGA_MODE_TEXT_SOLID || refcon->mode == MGA_MODE_TEXT_BOTH) {
+                solid_a = orig_a * (refcon->box_opacity / 100.0);
+              }
+
+              double outline_a = 0.0;
+              if (refcon->mode == MGA_MODE_TEXT_OUTLINE || refcon->mode == MGA_MODE_TEXT_BOTH) {
+                double diff = fill_a - orig_a;
+                if (diff < 0.0) diff = 0.0;
+                outline_a = diff * (refcon->outline_opacity / 100.0);
+              }
+
+              if (refcon->mode == MGA_MODE_TEXT_BOTH) {
+                text_a = outline_a + solid_a * (1.0 - outline_a);
+                if (text_a > 0.0) {
+                  double outline_r = refcon->outline_color.red / 255.0;
+                  double outline_g = refcon->outline_color.green / 255.0;
+                  double outline_b = refcon->outline_color.blue / 255.0;
+
+                  double solid_r = refcon->box_color.red / 255.0;
+                  double solid_g = refcon->box_color.green / 255.0;
+                  double solid_b = refcon->box_color.blue / 255.0;
+
+                  text_r = (outline_r * outline_a + solid_r * solid_a * (1.0 - outline_a)) / text_a;
+                  text_g = (outline_g * outline_a + solid_g * solid_a * (1.0 - outline_a)) / text_a;
+                  text_b = (outline_b * outline_a + solid_b * solid_a * (1.0 - outline_a)) / text_a;
+                }
+              } else if (refcon->mode == MGA_MODE_TEXT_OUTLINE) {
+                if (refcon->fill_outline) {
+                  text_a = outline_a + orig_a * (1.0 - outline_a);
+                  if (text_a > 0.0) {
+                    double outline_r = refcon->outline_color.red / 255.0;
+                    double outline_g = refcon->outline_color.green / 255.0;
+                    double outline_b = refcon->outline_color.blue / 255.0;
+
+                    text_r = (outline_r * outline_a + orig_r * orig_a * (1.0 - outline_a)) / text_a;
+                    text_g = (outline_g * outline_a + orig_g * orig_a * (1.0 - outline_a)) / text_a;
+                    text_b = (outline_b * outline_a + orig_b * orig_a * (1.0 - outline_a)) / text_a;
+                  }
+                } else {
+                  text_a = outline_a;
+                  text_r = refcon->outline_color.red / 255.0;
+                  text_g = refcon->outline_color.green / 255.0;
+                  text_b = refcon->outline_color.blue / 255.0;
+                }
+              } else {
+                text_a = solid_a;
+                text_r = refcon->box_color.red / 255.0;
+                text_g = refcon->box_color.green / 255.0;
+                text_b = refcon->box_color.blue / 255.0;
+              }
+            } else {
+              // For box modes (Outline, Solid Box, Outline & Solid, Custom Layer),
+              // if Show Text is enabled, draw the original text over the box
+              text_a = orig_a;
+              text_r = orig_r;
+              text_g = orig_g;
+              text_b = orig_b;
+            }
           }
-        } else {
-          current_alpha = outline_a;
-          cur_r = refcon->outline_color.red / 255.0;
-          cur_g = refcon->outline_color.green / 255.0;
-          cur_b = refcon->outline_color.blue / 255.0;
-        }
-      } else {
-        current_alpha = solid_a;
-        cur_r = refcon->box_color.red / 255.0;
-        cur_g = refcon->box_color.green / 255.0;
-        cur_b = refcon->box_color.blue / 255.0;
-      }
-    } else if (refcon->mode == MGA_MODE_CUSTOM_LAYER &&
-               sample.has_custom_layer) {
-      double bounds_w =
-          sample.custom_bounds.max_x - sample.custom_bounds.min_x + 1.0;
-      double bounds_h =
-          sample.custom_bounds.max_y - sample.custom_bounds.min_y + 1.0;
-      if (bounds_w < 1.0)
-        bounds_w = 1.0;
-      if (bounds_h < 1.0)
-        bounds_h = 1.0;
-
-      double aspect_custom = bounds_w / bounds_h;
-      double sprite_w = box_w;
-      double sprite_h = box_h;
-
-      if (refcon->keep_aspect) {
-        double aspect_box = box_w / box_h;
-        if (aspect_custom > aspect_box) {
-          // Custom layer content is wider than box: fit horizontally, height
-          // shrinks
-          sprite_w = box_w;
-          sprite_h = box_w / aspect_custom;
-        } else {
-          // Custom layer content is taller than box: fit vertically, width
-          // shrinks
-          sprite_h = box_h;
-          sprite_w = box_h * aspect_custom;
-        }
-      }
-
-      double u_content = (rx / sprite_w) + 0.5;
-      double v_content = (ry / sprite_h) + 0.5;
-
-      if (u_content >= 0.0 && u_content <= 1.0 && v_content >= 0.0 &&
-          v_content <= 1.0) {
-        double pixel_x =
-            sample.custom_bounds.min_x + u_content * (bounds_w - 1.0);
-        double pixel_y =
-            sample.custom_bounds.min_y + v_content * (bounds_h - 1.0);
-
-        double u_world = pixel_x / (sample.custom_world.width - 1.0);
-        double v_world = pixel_y / (sample.custom_world.height - 1.0);
-
-        double smp_r = 0.0, smp_g = 0.0, smp_b = 0.0, smp_a = 0.0;
-        double max_val = is_deep ? 32768.0 : 255.0;
-        if (is_deep) {
-          sample_bilinear<PF_Pixel16, PF_Pixel16>(&sample.custom_world, u_world,
-                                                  v_world, &smp_r, &smp_g,
-                                                  &smp_b, &smp_a, max_val);
-        } else {
-          sample_bilinear<PF_Pixel8, PF_Pixel8>(&sample.custom_world, u_world,
-                                                v_world, &smp_r, &smp_g, &smp_b,
-                                                &smp_a, max_val);
         }
 
-        double mask_a = (dist < 0.5) ? (dist < -0.5 ? 1.0 : (0.5 - dist)) : 0.0;
-        smp_a *= mask_a;
-
-        current_alpha = smp_a * (refcon->box_opacity / 100.0) * box.max_alpha;
-        cur_r = smp_r;
-        cur_g = smp_g;
-        cur_b = smp_b;
-      }
-    } else {
-      double solid_a = 0.0;
-      if (refcon->mode == MGA_MODE_SOLID || refcon->mode == MGA_MODE_BOTH) {
-        solid_a = (dist < 0.5) ? (dist < -0.5 ? 1.0 : (0.5 - dist)) : 0.0;
-        solid_a *= (refcon->box_opacity / 100.0) * box.max_alpha;
-      }
-
-      double outline_a = 0.0;
-      if (refcon->mode == MGA_MODE_OUTLINE || refcon->mode == MGA_MODE_BOTH) {
-        double outline_dist = abs(dist) - (refcon->render_stroke_width / 2.0);
-        outline_a = (outline_dist < 0.5)
-                        ? (outline_dist < -0.5 ? 1.0 : (0.5 - outline_dist))
-                        : 0.0;
-        outline_a *= (refcon->outline_opacity / 100.0) * box.max_alpha;
-      }
-
-      if (refcon->mode == MGA_MODE_BOTH) {
-        current_alpha = outline_a + solid_a * (1.0 - outline_a);
+        // Composite/blend text on top of shape box
+        double current_alpha = text_a + shape_a * (1.0 - text_a);
+        double cur_r = 0.0, cur_g = 0.0, cur_b = 0.0;
         if (current_alpha > 0.0) {
-          double outline_r = refcon->outline_color.red / 255.0;
-          double outline_g = refcon->outline_color.green / 255.0;
-          double outline_b = refcon->outline_color.blue / 255.0;
-
-          double solid_r = refcon->box_color.red / 255.0;
-          double solid_g = refcon->box_color.green / 255.0;
-          double solid_b = refcon->box_color.blue / 255.0;
-
-          cur_r =
-              (outline_r * outline_a + solid_r * solid_a * (1.0 - outline_a)) /
-              current_alpha;
-          cur_g =
-              (outline_g * outline_a + solid_g * solid_a * (1.0 - outline_a)) /
-              current_alpha;
-          cur_b =
-              (outline_b * outline_a + solid_b * solid_a * (1.0 - outline_a)) /
-              current_alpha;
+          cur_r = (text_r * text_a + shape_r * shape_a * (1.0 - text_a)) / current_alpha;
+          cur_g = (text_g * text_a + shape_g * shape_a * (1.0 - text_a)) / current_alpha;
+          cur_b = (text_b * text_a + shape_b * shape_a * (1.0 - text_a)) / current_alpha;
         }
-      } else if (refcon->mode == MGA_MODE_OUTLINE) {
-        current_alpha = outline_a;
-        cur_r = refcon->outline_color.red / 255.0;
-        cur_g = refcon->outline_color.green / 255.0;
-        cur_b = refcon->outline_color.blue / 255.0;
-      } else {
-        current_alpha = solid_a;
-        cur_r = refcon->box_color.red / 255.0;
-        cur_g = refcon->box_color.green / 255.0;
-        cur_b = refcon->box_color.blue / 255.0;
-      }
-    }
 
-    if (current_alpha >= max_accum_alpha && current_alpha > 0.0) {
-      max_accum_alpha = current_alpha;
-      blended_r = cur_r;
-      blended_g = cur_g;
-      blended_b = cur_b;
+        // Accumulate coverage across all boxes and repeats using standard alpha blending
+        if (current_alpha > 0.0) {
+          if (max_accum_alpha == 0.0) {
+            max_accum_alpha = current_alpha;
+            blended_r = cur_r;
+            blended_g = cur_g;
+            blended_b = cur_b;
+          } else {
+            double old_a = max_accum_alpha;
+            max_accum_alpha = current_alpha + old_a * (1.0 - current_alpha);
+            if (max_accum_alpha > 0.0) {
+              blended_r = (cur_r * current_alpha + blended_r * old_a * (1.0 - current_alpha)) / max_accum_alpha;
+              blended_g = (cur_g * current_alpha + blended_g * old_a * (1.0 - current_alpha)) / max_accum_alpha;
+              blended_b = (cur_b * current_alpha + blended_b * old_a * (1.0 - current_alpha)) / max_accum_alpha;
+            }
+          }
+        }
+      }
     }
   }
 
-  *out_a = max_accum_alpha;
   *out_r = blended_r;
   *out_g = blended_g;
   *out_b = blended_b;
+  *out_a = max_accum_alpha;
 }
 
 inline void RefineSubpixelBBoxes(std::vector<BBox> &boxes,
@@ -917,6 +974,69 @@ inline void RefineSubpixelBBoxes(std::vector<BBox> &boxes,
       MGA_LOG(ss.str());
     }
   }
+}
+
+static PF_Err UnrotateInputWorld(PF_InData *in_data, const PF_EffectWorld *input, double theta, double cx, double cy, PF_EffectWorld *output) {
+  PF_Err err = PF_Err_NONE;
+  int width = input->width;
+  int height = input->height;
+  bool is_deep = PF_WORLD_IS_DEEP(input);
+
+  // Clear output to transparent
+  for (int y = 0; y < height; ++y) {
+    if (is_deep) {
+      PF_Pixel16 *row = (PF_Pixel16 *)((char *)output->data + y * output->rowbytes);
+      for (int x = 0; x < width; ++x) {
+        row[x].alpha = 0;
+        row[x].red = 0;
+        row[x].green = 0;
+        row[x].blue = 0;
+      }
+    } else {
+      PF_Pixel8 *row = (PF_Pixel8 *)((char *)output->data + y * output->rowbytes);
+      for (int x = 0; x < width; ++x) {
+        row[x].alpha = 0;
+        row[x].red = 0;
+        row[x].green = 0;
+        row[x].blue = 0;
+      }
+    }
+  }
+
+  double cos_t = cos(theta);
+  double sin_t = sin(theta);
+
+  // Fill output by sampling from input using forward rotation
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      double dx = (double)x - cx;
+      double dy = (double)y - cy;
+      double rx = cx + dx * cos_t - dy * sin_t;
+      double ry = cy + dx * sin_t + dy * cos_t;
+
+      if (rx >= 0.0 && rx < width && ry >= 0.0 && ry < height) {
+        double u = rx / (width - 1.0);
+        double v = ry / (height - 1.0);
+        double r = 0.0, g = 0.0, b = 0.0, a = 0.0;
+        if (is_deep) {
+          sample_bilinear<PF_Pixel16, PF_Pixel16>(input, u, v, &r, &g, &b, &a, 32768.0);
+          PF_Pixel16 *row = (PF_Pixel16 *)((char *)output->data + y * output->rowbytes);
+          row[x].alpha = (A_u_short)clamped_channel(a * 32768.0, 32768.0);
+          row[x].red = (A_u_short)clamped_channel(r * 32768.0, 32768.0);
+          row[x].green = (A_u_short)clamped_channel(g * 32768.0, 32768.0);
+          row[x].blue = (A_u_short)clamped_channel(b * 32768.0, 32768.0);
+        } else {
+          sample_bilinear<PF_Pixel8, PF_Pixel8>(input, u, v, &r, &g, &b, &a, 255.0);
+          PF_Pixel8 *row = (PF_Pixel8 *)((char *)output->data + y * output->rowbytes);
+          row[x].alpha = (A_u_char)clamped_channel(a * 255.0, 255.0);
+          row[x].red = (A_u_char)clamped_channel(r * 255.0, 255.0);
+          row[x].green = (A_u_char)clamped_channel(g * 255.0, 255.0);
+          row[x].blue = (A_u_char)clamped_channel(b * 255.0, 255.0);
+        }
+      }
+    }
+  }
+  return err;
 }
 
 std::vector<BBox> FindTargetBoxes(PF_InData *in_data, PF_EffectWorld *input,
@@ -1374,11 +1494,49 @@ static PF_Err RenderFunc8(void *refcon, A_long xL, A_long yL, PF_Pixel8 *inP,
     return PF_Err_NONE;
   }
 
+  double text_target_x = (double)xL;
+  double text_target_y = (double)yL;
+
+  if (rc->has_layer_transform) {
+    double dx = text_target_x - rc->layer_cx;
+    double dy = text_target_y - rc->layer_cy;
+    text_target_x = rc->layer_cx + dx * rc->cos_total_theta - dy * rc->sin_total_theta;
+    text_target_y = rc->layer_cy + dx * rc->sin_total_theta + dy * rc->cos_total_theta;
+  }
+
+  if (rc->repeater_enable) {
+    double xt = text_target_x - rc->repeater_trans_x;
+    double yt = text_target_y - rc->repeater_trans_y;
+    double dx = xt - rc->global_cx;
+    double dy = yt - rc->global_cy;
+    text_target_x = rc->global_cx + dx * rc->repeater_trans_cos + dy * rc->repeater_trans_sin;
+    text_target_y = rc->global_cy - dx * rc->repeater_trans_sin + dy * rc->repeater_trans_cos;
+  }
+
   double accum_r = 0.0, accum_g = 0.0, accum_b = 0.0, accum_a = 0.0;
 
   for (int i = 0; i < rc->num_samples; ++i) {
+    double target_x = (double)xL;
+    double target_y = (double)yL;
+
+    if (rc->samples[i].has_layer_transform) {
+      double dx = target_x - rc->samples[i].layer_cx;
+      double dy = target_y - rc->samples[i].layer_cy;
+      target_x = rc->samples[i].layer_cx + dx * rc->samples[i].cos_total_theta - dy * rc->samples[i].sin_total_theta;
+      target_y = rc->samples[i].layer_cy + dx * rc->samples[i].sin_total_theta + dy * rc->samples[i].cos_total_theta;
+    }
+
+    if (rc->repeater_enable) {
+      double xt = target_x - rc->repeater_trans_x;
+      double yt = target_y - rc->repeater_trans_y;
+      double dx = xt - rc->global_cx;
+      double dy = yt - rc->global_cy;
+      target_x = rc->global_cx + dx * rc->repeater_trans_cos + dy * rc->repeater_trans_sin;
+      target_y = rc->global_cy - dx * rc->repeater_trans_sin + dy * rc->repeater_trans_cos;
+    }
+
     double cur_r = 0.0, cur_g = 0.0, cur_b = 0.0, cur_a = 0.0;
-    GetBoxCoverage((double)xL, (double)yL, rc, rc->samples[i], &cur_r, &cur_g,
+    GetBoxCoverage(target_x, target_y, rc, rc->samples[i], &cur_r, &cur_g,
                    &cur_b, &cur_a, false);
     accum_r += cur_r * cur_a;
     accum_g += cur_g * cur_a;
@@ -1398,6 +1556,16 @@ static PF_Err RenderFunc8(void *refcon, A_long xL, A_long yL, PF_Pixel8 *inP,
   double in_g = inP->green / 255.0;
   double in_b = inP->blue / 255.0;
   double in_a = inP->alpha / 255.0;
+
+  if (rc->repeater_enable && (rc->repeater_trans_x != 0.0 || rc->repeater_trans_y != 0.0 || rc->repeater_trans_cos != 1.0)) {
+    in_r = 0.0; in_g = 0.0; in_b = 0.0; in_a = 0.0;
+    if (text_target_x >= 0.0 && text_target_x < rc->input->width &&
+        text_target_y >= 0.0 && text_target_y < rc->input->height) {
+      double u_world = text_target_x / (rc->input->width - 1.0);
+      double v_world = text_target_y / (rc->input->height - 1.0);
+      sample_bilinear<PF_Pixel8, PF_Pixel8>(rc->input, u_world, v_world, &in_r, &in_g, &in_b, &in_a, 255.0);
+    }
+  }
 
   double out_r = 0.0, out_g = 0.0, out_b = 0.0, out_a = 0.0;
 
@@ -1444,11 +1612,49 @@ static PF_Err RenderFunc16(void *refcon, A_long xL, A_long yL, PF_Pixel16 *inP,
     return PF_Err_NONE;
   }
 
+  double text_target_x = (double)xL;
+  double text_target_y = (double)yL;
+
+  if (rc->has_layer_transform) {
+    double dx = text_target_x - rc->layer_cx;
+    double dy = text_target_y - rc->layer_cy;
+    text_target_x = rc->layer_cx + dx * rc->cos_total_theta - dy * rc->sin_total_theta;
+    text_target_y = rc->layer_cy + dx * rc->sin_total_theta + dy * rc->cos_total_theta;
+  }
+
+  if (rc->repeater_enable) {
+    double xt = text_target_x - rc->repeater_trans_x;
+    double yt = text_target_y - rc->repeater_trans_y;
+    double dx = xt - rc->global_cx;
+    double dy = yt - rc->global_cy;
+    text_target_x = rc->global_cx + dx * rc->repeater_trans_cos + dy * rc->repeater_trans_sin;
+    text_target_y = rc->global_cy - dx * rc->repeater_trans_sin + dy * rc->repeater_trans_cos;
+  }
+
   double accum_r = 0.0, accum_g = 0.0, accum_b = 0.0, accum_a = 0.0;
 
   for (int i = 0; i < rc->num_samples; ++i) {
+    double target_x = (double)xL;
+    double target_y = (double)yL;
+
+    if (rc->samples[i].has_layer_transform) {
+      double dx = target_x - rc->samples[i].layer_cx;
+      double dy = target_y - rc->samples[i].layer_cy;
+      target_x = rc->samples[i].layer_cx + dx * rc->samples[i].cos_total_theta - dy * rc->samples[i].sin_total_theta;
+      target_y = rc->samples[i].layer_cy + dx * rc->samples[i].sin_total_theta + dy * rc->samples[i].cos_total_theta;
+    }
+
+    if (rc->repeater_enable) {
+      double xt = target_x - rc->repeater_trans_x;
+      double yt = target_y - rc->repeater_trans_y;
+      double dx = xt - rc->global_cx;
+      double dy = yt - rc->global_cy;
+      target_x = rc->global_cx + dx * rc->repeater_trans_cos + dy * rc->repeater_trans_sin;
+      target_y = rc->global_cy - dx * rc->repeater_trans_sin + dy * rc->repeater_trans_cos;
+    }
+
     double cur_r = 0.0, cur_g = 0.0, cur_b = 0.0, cur_a = 0.0;
-    GetBoxCoverage((double)xL, (double)yL, rc, rc->samples[i], &cur_r, &cur_g,
+    GetBoxCoverage(target_x, target_y, rc, rc->samples[i], &cur_r, &cur_g,
                    &cur_b, &cur_a, true);
     accum_r += cur_r * cur_a;
     accum_g += cur_g * cur_a;
@@ -1468,6 +1674,16 @@ static PF_Err RenderFunc16(void *refcon, A_long xL, A_long yL, PF_Pixel16 *inP,
   double in_g = inP->green / 32768.0;
   double in_b = inP->blue / 32768.0;
   double in_a = inP->alpha / 32768.0;
+
+  if (rc->repeater_enable && (rc->repeater_trans_x != 0.0 || rc->repeater_trans_y != 0.0 || rc->repeater_trans_cos != 1.0)) {
+    in_r = 0.0; in_g = 0.0; in_b = 0.0; in_a = 0.0;
+    if (text_target_x >= 0.0 && text_target_x < rc->input->width &&
+        text_target_y >= 0.0 && text_target_y < rc->input->height) {
+      double u_world = text_target_x / (rc->input->width - 1.0);
+      double v_world = text_target_y / (rc->input->height - 1.0);
+      sample_bilinear<PF_Pixel16, PF_Pixel16>(rc->input, u_world, v_world, &in_r, &in_g, &in_b, &in_a, 32768.0);
+    }
+  }
 
   double out_r = 0.0, out_g = 0.0, out_b = 0.0, out_a = 0.0;
 
@@ -1518,7 +1734,8 @@ static PF_Err GlobalSetup(PF_InData *in_data, PF_OutData *out_data,
 
   out_data->out_flags =
       PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_I_USE_SHUTTER_ANGLE |
-      PF_OutFlag_WIDE_TIME_INPUT | PF_OutFlag_SEND_UPDATE_PARAMS_UI;
+      PF_OutFlag_WIDE_TIME_INPUT | PF_OutFlag_SEND_UPDATE_PARAMS_UI |
+      PF_OutFlag_I_EXPAND_BUFFER;
   out_data->out_flags2 = PF_OutFlag2_SUPPORTS_THREADED_RENDERING |
                          PF_OutFlag2_AUTOMATIC_WIDE_TIME_INPUT;
 
@@ -1671,6 +1888,50 @@ static PF_Err ParamsSetup(PF_InData *in_data, PF_OutData *out_data,
   PF_ADD_CHECKBOX(STR(StrID_FillOutline_Param_Name), "", FALSE, 0,
                   FILL_OUTLINE_DISK_ID);
 
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_CHECKBOX("Repeater Enable", "", FALSE, 0, REPEATER_ENABLE_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Count Left", 0, 50, 0, 50, 0, PF_Precision_INTEGER, 0, 0, REPEATER_COUNT_L_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Count Right", 0, 50, 0, 50, 0, PF_Precision_INTEGER, 0, 0, REPEATER_COUNT_R_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Count Up", 0, 50, 0, 50, 0, PF_Precision_INTEGER, 0, 0, REPEATER_COUNT_U_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Count Down", 0, 50, 0, 50, 0, PF_Precision_INTEGER, 0, 0, REPEATER_COUNT_D_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Gap X", -1000, 5000, -100, 500, 10, PF_Precision_TENTHS, 0, 0, REPEATER_GAP_X_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Gap Y", -1000, 5000, -100, 500, 10, PF_Precision_TENTHS, 0, 0, REPEATER_GAP_Y_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Offset X", -2000, 2000, -200, 200, 0, PF_Precision_TENTHS, 0, 0, REPEATER_OFFSET_X_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Offset Y", -2000, 2000, -200, 200, 0, PF_Precision_TENTHS, 0, 0, REPEATER_OFFSET_Y_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_CHECKBOX("Show Text", "", TRUE, 0, REPEATER_SHOW_TEXT_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_CHECKBOX("Show Shape", "", TRUE, 0, REPEATER_SHOW_SHAPE_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Repeater Trans X", -5000, 5000, -1000, 1000, 0,
+                       PF_Precision_TENTHS, 0, 0, REPEATER_TRANS_X_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Repeater Trans Y", -5000, 5000, -1000, 1000, 0,
+                       PF_Precision_TENTHS, 0, 0, REPEATER_TRANS_Y_DISK_ID);
+
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_ANGLE("Repeater Trans Rotate", 0, REPEATER_TRANS_ROTATE_DISK_ID);
+
   out_data->num_params = MGA_NUM_PARAMS;
 
   return err;
@@ -1803,10 +2064,435 @@ static PF_Err CallIterate(PF_InData *in_data, A_long linesL,
   return err;
 }
 
+static void SumTextAnimatorRotations(
+    AEGP_SuiteHandler &suites,
+    AEGP_StreamRefH parent_group,
+    const A_Time *t,
+    double *accum_rotation_rad) {
+  A_long num_streams = 0;
+  if (suites.DynamicStreamSuite4() && suites.DynamicStreamSuite4()->AEGP_GetNumStreamsInGroup(parent_group, &num_streams) == A_Err_NONE && num_streams > 0) {
+    for (A_long i = 0; i < num_streams; ++i) {
+      AEGP_StreamRefH streamH = NULL;
+      if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefByIndex(s_my_aegp_id, parent_group, i, &streamH) == A_Err_NONE && streamH) {
+        AEGP_StreamGroupingType grouping_type = AEGP_StreamGroupingType_NONE;
+        suites.DynamicStreamSuite4()->AEGP_GetStreamGroupingType(streamH, &grouping_type);
+        
+        if (grouping_type == AEGP_StreamGroupingType_NAMED_GROUP || grouping_type == AEGP_StreamGroupingType_INDEXED_GROUP) {
+          SumTextAnimatorRotations(suites, streamH, t, accum_rotation_rad);
+        } else if (grouping_type == AEGP_StreamGroupingType_LEAF) {
+          char match_name[AEGP_MAX_STREAM_MATCH_NAME_SIZE] = {0};
+          if (suites.DynamicStreamSuite4()->AEGP_GetMatchName(streamH, match_name) == A_Err_NONE) {
+            if (strcmp(match_name, "ADBE Text Rotation") == 0) {
+              AEGP_StreamValue2 val;
+              AEFX_CLR_STRUCT(val);
+              if (suites.StreamSuite5()->AEGP_GetNewStreamValue(s_my_aegp_id, streamH, AEGP_LTimeMode_CompTime, t, TRUE, &val) == A_Err_NONE) {
+                *accum_rotation_rad += val.val.one_d * (3.14159265358979323846 / 180.0);
+                suites.StreamSuite5()->AEGP_DisposeStreamValue(&val);
+              }
+            }
+          }
+        }
+        suites.StreamSuite5()->AEGP_DisposeStream(streamH);
+      }
+    }
+  }
+}
+
+static double GetTextLayerAnimatorRotation(
+    AEGP_SuiteHandler &suites,
+    AEGP_LayerH layerH,
+    const A_Time *t) {
+  double accum_rotation_rad = 0.0;
+  if (suites.DynamicStreamSuite4()) {
+    AEGP_StreamRefH root_streamH = NULL;
+    if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefForLayer(s_my_aegp_id, layerH, &root_streamH) == A_Err_NONE && root_streamH) {
+      AEGP_StreamRefH text_prop_groupH = NULL;
+      if (suites.DynamicStreamSuite4()->AEGP_GetNewStreamRefByMatchname(s_my_aegp_id, root_streamH, "ADBE Text Properties", &text_prop_groupH) == A_Err_NONE && text_prop_groupH) {
+        SumTextAnimatorRotations(suites, text_prop_groupH, t, &accum_rotation_rad);
+        suites.StreamSuite5()->AEGP_DisposeStream(text_prop_groupH);
+      }
+      suites.StreamSuite5()->AEGP_DisposeStream(root_streamH);
+    }
+  }
+  return accum_rotation_rad;
+}
+
+struct SampleTransform {
+  bool has_layer_transform;
+  double layer_rotation_rad;
+  double layer_cx;
+  double layer_cy;
+  double animator_rotation_rad;
+  A_Matrix4 layer_matrix;
+};
+
+struct FrameData {
+  bool is_text;
+  bool is_collapsed;
+  std::vector<SampleTransform> samples;
+};
+
+static void GetMotionBlurSettings(
+    PF_InData *in_data,
+    AEGP_SuiteHandler &suites,
+    AEGP_LayerH layerH,
+    int mb_enable,
+    int mb_samples_param,
+    bool &do_mb,
+    int &effective_samples,
+    double &shutter_angle_deg,
+    double &shutter_phase_deg) {
+  do_mb = false;
+  effective_samples = 1;
+  shutter_angle_deg = 180.0;
+  shutter_phase_deg = -90.0;
+
+  if (mb_enable == 1) { // Off
+    do_mb = false;
+  } else if (mb_enable == 2) { // Comp Setting
+    bool is_layer_mb_on = false;
+    int comp_samples = 16;
+    double comp_shutter_angle = 180.0;
+    double comp_shutter_phase = -90.0;
+
+    if (suites.PFInterfaceSuite1() && suites.LayerSuite8() && suites.CompSuite11() && layerH) {
+      AEGP_LayerFlags lflags = 0;
+      suites.LayerSuite8()->AEGP_GetLayerFlags(layerH, &lflags);
+      is_layer_mb_on = (lflags & AEGP_LayerFlag_MOTION_BLUR) != 0;
+
+      AEGP_CompH compH = NULL;
+      suites.LayerSuite8()->AEGP_GetLayerParentComp(layerH, &compH);
+      if (compH) {
+        A_long samples_val = 0;
+        A_Err s_err = suites.CompSuite11()->AEGP_GetCompSuggestedMotionBlurSamples(compH, &samples_val);
+        if (!s_err && samples_val > 0) {
+          comp_samples = (int)samples_val;
+        }
+        A_Ratio angle, phase;
+        A_Err ap_err = suites.CompSuite11()->AEGP_GetCompShutterAnglePhase(compH, &angle, &phase);
+        if (!ap_err) {
+          if (angle.den != 0)
+            comp_shutter_angle = (double)angle.num / (double)angle.den;
+          if (phase.den != 0)
+            comp_shutter_phase = (double)phase.num / (double)phase.den;
+        }
+      }
+    }
+
+    if (is_layer_mb_on && in_data->shutter_angle > 0) {
+      do_mb = true;
+      effective_samples = comp_samples;
+      if (effective_samples > 16) {
+        effective_samples = 16;
+      }
+      shutter_angle_deg = comp_shutter_angle * 360.0;
+      shutter_phase_deg = comp_shutter_phase * 360.0;
+    }
+  } else if (mb_enable == 3) { // On
+    do_mb = true;
+    effective_samples = mb_samples_param;
+    if (effective_samples > 16) {
+      effective_samples = 16;
+    }
+    shutter_angle_deg = (double)in_data->shutter_angle / 256.0;
+    shutter_phase_deg = (double)in_data->shutter_phase / 256.0;
+    if (shutter_angle_deg <= 0.0) {
+      shutter_angle_deg = 180.0;
+      shutter_phase_deg = -90.0;
+    }
+  }
+}
+
+static PF_Err FrameSetup(PF_InData *in_data, PF_OutData *out_data,
+                         PF_ParamDef *params[], PF_LayerDef *output) {
+  PF_Err err = PF_Err_NONE;
+  out_data->width = params[MGA_INPUT]->u.ld.width;
+  out_data->height = params[MGA_INPUT]->u.ld.height;
+  MGA_LOG("FrameSetup entry: out_data size set to " + std::to_string(out_data->width) + "x" + std::to_string(out_data->height));
+
+  AEGP_SuiteHandler suites(in_data->pica_basicP);
+
+  if (!suites.HandleSuite1()) {
+    MGA_LOG("FrameSetup ERR: HandleSuite1 is NULL");
+    return PF_Err_INTERNAL_STRUCT_DAMAGED;
+  }
+
+  PF_Handle handle = suites.HandleSuite1()->host_new_handle(sizeof(FrameData*));
+  if (!handle) {
+    MGA_LOG("FrameSetup ERR: host_new_handle returned NULL");
+    return PF_Err_OUT_OF_MEMORY;
+  }
+
+  FrameData **fd_ptr = (FrameData **)suites.HandleSuite1()->host_lock_handle(handle);
+  if (!fd_ptr) {
+    MGA_LOG("FrameSetup ERR: host_lock_handle returned NULL");
+    suites.HandleSuite1()->host_dispose_handle(handle);
+    return PF_Err_OUT_OF_MEMORY;
+  }
+
+  FrameData *fd = new FrameData();
+  *fd_ptr = fd;
+
+  fd->is_text = false;
+  fd->is_collapsed = false;
+
+  AEGP_LayerH layerH = NULL;
+  if (suites.PFInterfaceSuite1() && suites.LayerSuite8()) {
+    A_Err a_err = suites.PFInterfaceSuite1()->AEGP_GetEffectLayer(in_data->effect_ref, &layerH);
+    MGA_LOG("FrameSetup: AEGP_GetEffectLayer returned " + std::to_string(a_err) + ", layerH = " + std::to_string((uintptr_t)layerH));
+    if (!a_err && layerH) {
+      AEGP_ObjectType obj_type = AEGP_ObjectType_NONE;
+      AEGP_LayerFlags flags = 0;
+      if (!suites.LayerSuite8()->AEGP_GetLayerObjectType(layerH, &obj_type)) {
+        fd->is_text = (obj_type == AEGP_ObjectType_TEXT);
+      }
+      if (!suites.LayerSuite8()->AEGP_GetLayerFlags(layerH, &flags)) {
+        fd->is_collapsed = ((flags & AEGP_LayerFlag_COLLAPSE) != 0);
+      }
+    }
+  }
+  MGA_LOG("FrameSetup: is_text = " + std::to_string(fd->is_text) + ", is_collapsed = " + std::to_string(fd->is_collapsed));
+
+  // Calculate sample times (motion blur)
+  std::vector<A_long> sample_times;
+  int mb_enable = params[MGA_MB_ENABLE]->u.pd.value;
+  int mb_samples_param = (int)params[MGA_MB_SAMPLES]->u.fs_d.value;
+  
+  bool do_mb = false;
+  int effective_samples = 1;
+  double shutter_angle_deg = 180.0;
+  double shutter_phase_deg = -90.0;
+  GetMotionBlurSettings(in_data, suites, layerH, mb_enable, mb_samples_param, do_mb, effective_samples, shutter_angle_deg, shutter_phase_deg);
+  MGA_LOG("FrameSetup: mb_enable = " + std::to_string(mb_enable) + ", mb_samples_param = " + std::to_string(mb_samples_param) + ", effective_samples = " + std::to_string(effective_samples));
+
+  if (effective_samples == 1) {
+    sample_times.push_back(in_data->current_time);
+  } else {
+    double d_shutter = (double)in_data->time_step * (shutter_angle_deg / 360.0);
+    double t_start = (double)in_data->current_time +
+                     (double)in_data->time_step * (shutter_phase_deg / 360.0);
+    for (int i = 0; i < effective_samples; ++i) {
+      double frac = (double)i / (effective_samples - 1);
+      double t = t_start + d_shutter * frac;
+      A_long t_i = (A_long)round(t);
+      if (t_i < 0) t_i = 0;
+      sample_times.push_back(t_i);
+    }
+  }
+  MGA_LOG("FrameSetup: sample_times.size = " + std::to_string(sample_times.size()));
+
+  double scale_x = (double)in_data->width / (double)params[MGA_INPUT]->u.ld.width;
+  double scale_y = (double)in_data->height / (double)params[MGA_INPUT]->u.ld.height;
+
+  fd->samples.resize(sample_times.size());
+  for (size_t i = 0; i < sample_times.size(); ++i) {
+    A_long t_i = sample_times[i];
+    A_Time t_time = {t_i, in_data->time_scale};
+    
+    SampleTransform &st = fd->samples[i];
+    st.has_layer_transform = false;
+    st.layer_rotation_rad = 0.0;
+    st.layer_cx = 0.0;
+    st.layer_cy = 0.0;
+    st.animator_rotation_rad = 0.0;
+    AEFX_CLR_STRUCT(st.layer_matrix);
+
+    if (layerH && (fd->is_text || fd->is_collapsed)) {
+      A_Time comp_time = t_time;
+      if (suites.LayerSuite8()) {
+        suites.LayerSuite8()->AEGP_ConvertLayerToCompTime(layerH, &t_time, &comp_time);
+      }
+      A_Err xform_err = suites.LayerSuite8()->AEGP_GetLayerToWorldXform(layerH, &comp_time, &st.layer_matrix);
+      MGA_LOG("FrameSetup: AEGP_GetLayerToWorldXform returned " + std::to_string(xform_err));
+      if (!xform_err) {
+        st.layer_rotation_rad = atan2(st.layer_matrix.mat[0][1], st.layer_matrix.mat[0][0]);
+        
+        double anchor_x = 0.0;
+        double anchor_y = 0.0;
+        AEGP_StreamRefH anchor_streamH = NULL;
+        if (suites.StreamSuite5() && !suites.StreamSuite5()->AEGP_GetNewLayerStream(s_my_aegp_id, layerH, AEGP_LayerStream_ANCHORPOINT, &anchor_streamH) && anchor_streamH) {
+          AEGP_StreamValue2 val;
+          AEFX_CLR_STRUCT(val);
+          if (!suites.StreamSuite5()->AEGP_GetNewStreamValue(s_my_aegp_id, anchor_streamH, AEGP_LTimeMode_CompTime, &comp_time, TRUE, &val)) {
+            anchor_x = val.val.three_d.x;
+            anchor_y = val.val.three_d.y;
+            suites.StreamSuite5()->AEGP_DisposeStreamValue(&val);
+          }
+          suites.StreamSuite5()->AEGP_DisposeStream(anchor_streamH);
+        }
+        double downsample_x = (double)in_data->downsample_x.num / in_data->downsample_x.den;
+        double downsample_y = (double)in_data->downsample_y.num / in_data->downsample_y.den;
+        double world_cx_full = anchor_x * st.layer_matrix.mat[0][0] + anchor_y * st.layer_matrix.mat[1][0] + st.layer_matrix.mat[3][0];
+        double world_cy_full = anchor_x * st.layer_matrix.mat[0][1] + anchor_y * st.layer_matrix.mat[1][1] + st.layer_matrix.mat[3][1];
+        st.layer_cx = world_cx_full * downsample_x;
+        st.layer_cy = world_cy_full * downsample_y;
+        MGA_LOG("FrameSetup details: anchor_x=" + std::to_string(anchor_x) +
+                ", anchor_y=" + std::to_string(anchor_y) +
+                ", origin_x=" + std::to_string(params[MGA_INPUT]->u.ld.origin_x) +
+                ", origin_y=" + std::to_string(params[MGA_INPUT]->u.ld.origin_y) +
+                ", pre_effect_source_origin_x=" + std::to_string(in_data->pre_effect_source_origin_x) +
+                ", pre_effect_source_origin_y=" + std::to_string(in_data->pre_effect_source_origin_y) +
+                ", output_origin_x=" + std::to_string(in_data->output_origin_x) +
+                ", output_origin_y=" + std::to_string(in_data->output_origin_y) +
+                ", input_width=" + std::to_string(params[MGA_INPUT]->u.ld.width) +
+                ", input_height=" + std::to_string(params[MGA_INPUT]->u.ld.height) +
+                ", comp_width=" + std::to_string(in_data->width) +
+                ", comp_height=" + std::to_string(in_data->height));
+        
+        if (fd->is_text) {
+          st.animator_rotation_rad = GetTextLayerAnimatorRotation(suites, layerH, &comp_time);
+        }
+        st.has_layer_transform = true;
+      }
+    }
+  }
+
+  suites.HandleSuite1()->host_unlock_handle(handle);
+  out_data->frame_data = handle;
+  MGA_LOG("FrameSetup successful exit. handle set.");
+  return err;
+}
+
+static PF_Err FrameSetdown(PF_InData *in_data, PF_OutData *out_data,
+                           PF_ParamDef *params[], PF_LayerDef *output) {
+  PF_Err err = PF_Err_NONE;
+  AEGP_SuiteHandler suites(in_data->pica_basicP);
+
+  if (in_data->frame_data && suites.HandleSuite1()) {
+    FrameData **fd_ptr = (FrameData **)suites.HandleSuite1()->host_lock_handle(in_data->frame_data);
+    if (fd_ptr && *fd_ptr) {
+      delete *fd_ptr;
+    }
+    suites.HandleSuite1()->host_unlock_handle(in_data->frame_data);
+    suites.HandleSuite1()->host_dispose_handle(in_data->frame_data);
+    out_data->frame_data = NULL;
+  }
+  return err;
+}
+
 static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
                      PF_ParamDef *params[], PF_LayerDef *output) {
   PF_Err err = PF_Err_NONE, err2 = PF_Err_NONE;
   AEGP_SuiteHandler suites(in_data->pica_basicP);
+
+  double layer_rotation_rad = 0.0;
+  double layer_cx = 0.0;
+  double layer_cy = 0.0;
+  bool has_layer_transform = false;
+  bool is_text = false;
+  AEGP_LayerH layerH = NULL;
+  A_Matrix4 layer_matrix;
+  AEFX_CLR_STRUCT(layer_matrix);
+
+  FrameData *fd = NULL;
+  if (in_data->frame_data && suites.HandleSuite1()) {
+    FrameData **fd_ptr = (FrameData **)suites.HandleSuite1()->host_lock_handle(in_data->frame_data);
+    if (fd_ptr) {
+      fd = *fd_ptr;
+    }
+  }
+
+  MGA_LOG("Render: in_data->frame_data = " + std::to_string((uintptr_t)in_data->frame_data) + ", fd = " + std::to_string((uintptr_t)fd));
+
+  if (fd) {
+    MGA_LOG("Render: Using fd! samples count = " + std::to_string(fd->samples.size()));
+    is_text = fd->is_text;
+    int current_sample_idx = -1;
+    int mb_enable = params[MGA_MB_ENABLE]->u.pd.value;
+    int mb_samples_param = (int)params[MGA_MB_SAMPLES]->u.fs_d.value;
+    
+    AEGP_LayerH main_layerH = NULL;
+    if (suites.PFInterfaceSuite1()) {
+      suites.PFInterfaceSuite1()->AEGP_GetEffectLayer(in_data->effect_ref, &main_layerH);
+    }
+
+    bool do_mb = false;
+    int effective_samples = 1;
+    double shutter_angle_deg = 180.0;
+    double shutter_phase_deg = -90.0;
+    GetMotionBlurSettings(in_data, suites, main_layerH, mb_enable, mb_samples_param, do_mb, effective_samples, shutter_angle_deg, shutter_phase_deg);
+
+    std::vector<A_long> local_times;
+    if (effective_samples == 1) {
+      local_times.push_back(in_data->current_time);
+    } else {
+      double d_shutter = (double)in_data->time_step * (shutter_angle_deg / 360.0);
+      double t_start = (double)in_data->current_time + (double)in_data->time_step * (shutter_phase_deg / 360.0);
+      for (int i = 0; i < effective_samples; ++i) {
+        double frac = (double)i / (effective_samples - 1);
+        double t = t_start + d_shutter * frac;
+        A_long t_i = (A_long)round(t);
+        if (t_i < 0) t_i = 0;
+        local_times.push_back(t_i);
+      }
+    }
+
+    for (size_t i = 0; i < local_times.size(); ++i) {
+      if (local_times[i] == in_data->current_time) {
+        current_sample_idx = (int)i;
+        break;
+      }
+    }
+    if (current_sample_idx == -1 && !fd->samples.empty()) {
+      current_sample_idx = 0;
+    }
+
+    if (current_sample_idx >= 0 && current_sample_idx < (int)fd->samples.size()) {
+      const auto &st = fd->samples[current_sample_idx];
+      layer_rotation_rad = st.layer_rotation_rad;
+      layer_cx = st.layer_cx;
+      layer_cy = st.layer_cy;
+      has_layer_transform = st.has_layer_transform;
+      layer_matrix = st.layer_matrix;
+    }
+  } else {
+    MGA_LOG("Render: fd is NULL! Using fallback.");
+    if (suites.PFInterfaceSuite1() && suites.LayerSuite8()) {
+      A_Err a_err = suites.PFInterfaceSuite1()->AEGP_GetEffectLayer(in_data->effect_ref, &layerH);
+      if (!a_err && layerH) {
+        AEGP_ObjectType obj_type = AEGP_ObjectType_NONE;
+        AEGP_LayerFlags flags = 0;
+        bool is_collapsed = false;
+        if (!suites.LayerSuite8()->AEGP_GetLayerObjectType(layerH, &obj_type)) {
+          is_text = (obj_type == AEGP_ObjectType_TEXT);
+        }
+        if (!suites.LayerSuite8()->AEGP_GetLayerFlags(layerH, &flags)) {
+          is_collapsed = ((flags & AEGP_LayerFlag_COLLAPSE) != 0);
+        }
+
+        if (is_text || is_collapsed) {
+          A_Time t = {in_data->current_time, in_data->time_scale};
+          A_Time comp_time = t;
+          if (suites.LayerSuite8()) {
+            suites.LayerSuite8()->AEGP_ConvertLayerToCompTime(layerH, &t, &comp_time);
+          }
+          if (!suites.LayerSuite8()->AEGP_GetLayerToWorldXform(layerH, &comp_time, &layer_matrix)) {
+            layer_rotation_rad = atan2(layer_matrix.mat[0][1], layer_matrix.mat[0][0]);
+            double anchor_x = 0.0;
+            double anchor_y = 0.0;
+            AEGP_StreamRefH anchor_streamH = NULL;
+            if (suites.StreamSuite5() && !suites.StreamSuite5()->AEGP_GetNewLayerStream(s_my_aegp_id, layerH, AEGP_LayerStream_ANCHORPOINT, &anchor_streamH) && anchor_streamH) {
+              AEGP_StreamValue2 val;
+              AEFX_CLR_STRUCT(val);
+              if (!suites.StreamSuite5()->AEGP_GetNewStreamValue(s_my_aegp_id, anchor_streamH, AEGP_LTimeMode_CompTime, &comp_time, TRUE, &val)) {
+                anchor_x = val.val.three_d.x;
+                anchor_y = val.val.three_d.y;
+                suites.StreamSuite5()->AEGP_DisposeStreamValue(&val);
+              }
+              suites.StreamSuite5()->AEGP_DisposeStream(anchor_streamH);
+            }
+            double downsample_x = (double)in_data->downsample_x.num / in_data->downsample_x.den;
+            double downsample_y = (double)in_data->downsample_y.num / in_data->downsample_y.den;
+            double world_cx_full = anchor_x * layer_matrix.mat[0][0] + anchor_y * layer_matrix.mat[1][0] + layer_matrix.mat[3][0];
+            double world_cy_full = anchor_x * layer_matrix.mat[0][1] + anchor_y * layer_matrix.mat[1][1] + layer_matrix.mat[3][1];
+            layer_cx = world_cx_full * downsample_x;
+            layer_cy = world_cy_full * downsample_y;
+            has_layer_transform = true;
+          }
+        }
+      }
+    }
+  }
 
   int mode = params[MGA_MODE]->u.pd.value;
   int target = params[MGA_TARGET]->u.pd.value;
@@ -1838,6 +2524,23 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
   int mb_samples = (int)params[MGA_MB_SAMPLES]->u.fs_d.value;
   bool fill_outline = (params[MGA_FILL_OUTLINE]->u.bd.value != 0);
 
+  bool repeater_enable = (params[MGA_REPEATER_ENABLE]->u.bd.value != 0);
+  int repeater_count_l = (int)params[MGA_REPEATER_COUNT_L]->u.fs_d.value;
+  int repeater_count_r = (int)params[MGA_REPEATER_COUNT_R]->u.fs_d.value;
+  int repeater_count_u = (int)params[MGA_REPEATER_COUNT_U]->u.fs_d.value;
+  int repeater_count_d = (int)params[MGA_REPEATER_COUNT_D]->u.fs_d.value;
+  double repeater_gap_x = params[MGA_REPEATER_GAP_X]->u.fs_d.value;
+  double repeater_gap_y = params[MGA_REPEATER_GAP_Y]->u.fs_d.value;
+  double repeater_offset_x = params[MGA_REPEATER_OFFSET_X]->u.fs_d.value;
+  double repeater_offset_y = params[MGA_REPEATER_OFFSET_Y]->u.fs_d.value;
+  bool repeater_show_text = (params[MGA_REPEATER_SHOW_TEXT]->u.bd.value != 0);
+  bool repeater_show_shape = (params[MGA_REPEATER_SHOW_SHAPE]->u.bd.value != 0);
+  double repeater_trans_x = params[MGA_REPEATER_TRANS_X]->u.fs_d.value;
+  double repeater_trans_y = params[MGA_REPEATER_TRANS_Y]->u.fs_d.value;
+  double repeater_trans_rotate = (double)params[MGA_REPEATER_TRANS_ROTATE]->u.ad.value / 65536.0;
+
+
+
   double scale_x = 1.0;
   if (in_data->downsample_x.den != 0) {
     scale_x = (double)in_data->downsample_x.num / in_data->downsample_x.den;
@@ -1853,6 +2556,15 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
   double render_pad_right = pad_right * scale_x;
   double render_pad_top = pad_top * scale_y;
   double render_pad_bottom = pad_bottom * scale_y;
+  double render_repeater_gap_x = repeater_gap_x * scale_x;
+  double render_repeater_gap_y = repeater_gap_y * scale_y;
+  double render_repeater_offset_x = repeater_offset_x * scale_x;
+  double render_repeater_offset_y = repeater_offset_y * scale_y;
+  double render_repeater_trans_x = repeater_trans_x * scale_x;
+  double render_repeater_trans_y = repeater_trans_y * scale_y;
+  double trans_rad = repeater_trans_rotate * (3.14159265358979323846 / 180.0);
+  double trans_cos = cos(trans_rad);
+  double trans_sin = sin(trans_rad);
   double render_stroke_width = outline_width * ((scale_x + scale_y) / 2.0);
   double render_border_radius = border_radius * ((scale_x + scale_y) / 2.0);
 
@@ -1861,111 +2573,11 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
   double shutter_angle_deg = 180.0;
   double shutter_phase_deg = -90.0;
 
-  if (mb_enable == 1) { // Off
-    do_mb = false;
-  } else if (mb_enable == 2) { // Comp Setting
-    bool is_layer_mb_on = false;
-    int comp_samples = 16;
-    double comp_shutter_angle = 180.0;
-    double comp_shutter_phase = -90.0;
-
-    // OPTIMIZATION #5: removed a duplicate, shadowing
-    // `AEGP_SuiteHandler suites(...)` declaration that used to be here --
-    // the outer `suites` from the top of Render() is already in scope and
-    // valid, so re-constructing it was redundant work every render call.
-    MGA_LOG("Comp Setting: starting suites check");
-    if (suites.PFInterfaceSuite1() && suites.LayerSuite8() &&
-        suites.CompSuite11()) {
-      MGA_LOG("Comp Setting: suites are valid");
-      AEGP_LayerH layerH = NULL;
-      A_Err a_err = suites.PFInterfaceSuite1()->AEGP_GetEffectLayer(
-          in_data->effect_ref, &layerH);
-#ifdef _DEBUG
-      std::stringstream ss;
-      ss << "Comp Setting: AEGP_GetEffectLayer err=" << a_err
-         << ", layerH=" << layerH;
-      MGA_LOG(ss.str());
-#endif
-      if (layerH) {
-        AEGP_LayerFlags lflags = 0;
-        suites.LayerSuite8()->AEGP_GetLayerFlags(layerH, &lflags);
-        is_layer_mb_on = (lflags & AEGP_LayerFlag_MOTION_BLUR) != 0;
-#ifdef _DEBUG
-        ss.str("");
-        ss << "Comp Setting: lflags=" << lflags
-           << ", is_layer_mb_on=" << is_layer_mb_on;
-        MGA_LOG(ss.str());
-#endif
-
-        AEGP_CompH compH = NULL;
-        suites.LayerSuite8()->AEGP_GetLayerParentComp(layerH, &compH);
-#ifdef _DEBUG
-        ss.str("");
-        ss << "Comp Setting: compH=" << compH;
-        MGA_LOG(ss.str());
-#endif
-        if (compH) {
-          A_long samples_val = 0;
-          A_Err s_err =
-              suites.CompSuite11()->AEGP_GetCompSuggestedMotionBlurSamples(
-                  compH, &samples_val);
-          if (!s_err) {
-            if (samples_val > 0)
-              comp_samples = (int)samples_val;
-          }
-          A_Ratio angle, phase;
-          A_Err ap_err = suites.CompSuite11()->AEGP_GetCompShutterAnglePhase(
-              compH, &angle, &phase);
-          if (!ap_err) {
-            if (angle.den != 0)
-              comp_shutter_angle = (double)angle.num / (double)angle.den;
-            if (phase.den != 0)
-              comp_shutter_phase = (double)phase.num / (double)phase.den;
-          }
-#ifdef _DEBUG
-          ss.str("");
-          ss << "Comp Setting: Suggested samples=" << samples_val
-             << " (err=" << s_err << "), angle=" << comp_shutter_angle
-             << ", phase=" << comp_shutter_phase << " (err=" << ap_err << ")";
-          MGA_LOG(ss.str());
-#endif
-        }
-      }
-    } else {
-      MGA_LOG(
-          "Comp Setting: suites CHECK FAILED (one or more suites are NULL)");
-    }
-
-    if (is_layer_mb_on && in_data->shutter_angle > 0) {
-      do_mb = true;
-      effective_samples = comp_samples;
-      if (effective_samples > 16) {
-        effective_samples = 16;
-      }
-      shutter_angle_deg = comp_shutter_angle * 360.0;
-      shutter_phase_deg = comp_shutter_phase * 360.0;
-    }
-#ifdef _DEBUG
-    {
-      std::stringstream ss;
-      ss << "Comp Setting final: do_mb=" << do_mb
-         << ", effective_samples=" << effective_samples;
-      MGA_LOG(ss.str());
-    }
-#endif
-  } else if (mb_enable == 3) { // On
-    do_mb = true;
-    effective_samples = mb_samples;
-    if (effective_samples > 16) {
-      effective_samples = 16;
-    }
-    shutter_angle_deg = (double)in_data->shutter_angle / 256.0;
-    shutter_phase_deg = (double)in_data->shutter_phase / 256.0;
-    if (shutter_angle_deg <= 0.0) {
-      shutter_angle_deg = 180.0;
-      shutter_phase_deg = -90.0;
-    }
+  if (suites.PFInterfaceSuite1()) {
+    suites.PFInterfaceSuite1()->AEGP_GetEffectLayer(in_data->effect_ref, &layerH);
   }
+
+  GetMotionBlurSettings(in_data, suites, layerH, mb_enable, mb_samples, do_mb, effective_samples, shutter_angle_deg, shutter_phase_deg);
 
   std::vector<A_long> sample_times;
   if (!do_mb || effective_samples <= 1) {
@@ -2012,11 +2624,33 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
   rc.theta = rotate_deg * (3.14159265358979323846 / 180.0);
   rc.cos_theta = cos(-rc.theta);
   rc.sin_theta = sin(-rc.theta);
+  rc.has_layer_transform = has_layer_transform;
+  rc.layer_cx = has_layer_transform ? layer_cx : 0.0;
+  rc.layer_cy = has_layer_transform ? layer_cy : 0.0;
+  rc.total_theta = has_layer_transform ? layer_rotation_rad : 0.0;
+  rc.cos_total_theta = cos(-rc.total_theta);
+  rc.sin_total_theta = sin(-rc.total_theta);
   rc.keep_aspect = keep_aspect;
   rc.comp_mode = comp_mode;
   rc.fill_outline = fill_outline;
   rc.input = &params[MGA_INPUT]->u.ld;
   rc.output = output;
+
+  rc.repeater_enable = repeater_enable;
+  rc.repeater_count_l = repeater_count_l;
+  rc.repeater_count_r = repeater_count_r;
+  rc.repeater_count_u = repeater_count_u;
+  rc.repeater_count_d = repeater_count_d;
+  rc.repeater_gap_x = render_repeater_gap_x;
+  rc.repeater_gap_y = render_repeater_gap_y;
+  rc.repeater_offset_x = render_repeater_offset_x;
+  rc.repeater_offset_y = render_repeater_offset_y;
+  rc.repeater_show_text = repeater_show_text;
+  rc.repeater_show_shape = repeater_show_shape;
+  rc.repeater_trans_x = render_repeater_trans_x;
+  rc.repeater_trans_y = render_repeater_trans_y;
+  rc.repeater_trans_cos = trans_cos;
+  rc.repeater_trans_sin = trans_sin;
 
   rc.num_samples = (int)sample_times.size();
   rc.samples.resize(rc.num_samples);
@@ -2030,27 +2664,107 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
     AEFX_CLR_STRUCT(custom_checkouts[i]);
   }
 
+  std::vector<PF_EffectWorld> temp_worlds;
+
+  std::vector<BBox> local_boxes;
+  PF_EffectWorld main_temp_world;
+  AEFX_CLR_STRUCT(main_temp_world);
+  bool has_main_temp_world = false;
+
+  double main_rotation = layer_rotation_rad;
+  double main_anim_rot = 0.0;
+  if (is_text && layerH) {
+    A_Time t = {in_data->current_time, in_data->time_scale};
+    A_Time comp_time = t;
+    if (suites.LayerSuite8()) {
+      suites.LayerSuite8()->AEGP_ConvertLayerToCompTime(layerH, &t, &comp_time);
+    }
+    main_anim_rot = GetTextLayerAnimatorRotation(suites, layerH, &comp_time);
+  }
+  double main_total_rotation = main_rotation + main_anim_rot;
+
+  PF_EffectWorld *input_world = &params[MGA_INPUT]->u.ld;
+
+  if (has_layer_transform) {
+    A_Err new_world_err = in_data->utils->new_world(in_data->effect_ref, input_world->width, input_world->height, PF_NewWorldFlag_NONE, &main_temp_world);
+    if (new_world_err == PF_Err_NONE) {
+      UnrotateInputWorld(in_data, input_world, main_total_rotation, layer_cx, layer_cy, &main_temp_world);
+      local_boxes = FindTargetBoxes(in_data, &main_temp_world, target, word_gap, line_gap);
+      has_main_temp_world = true;
+      temp_worlds.push_back(main_temp_world);
+    }
+  } else {
+    local_boxes = FindTargetBoxes(in_data, input_world, target, word_gap, line_gap);
+  }
+
   for (int i = 0; i < rc.num_samples; ++i) {
     A_long t_i = sample_times[i];
 
-    PF_EffectWorld *input_world = nullptr;
-    if (t_i == in_data->current_time) {
-      input_world = &params[MGA_INPUT]->u.ld;
-    } else {
-      PF_Err checkout_err =
-          PF_CHECKOUT_PARAM(in_data, MGA_INPUT, t_i, in_data->time_step,
-                            in_data->time_scale, &input_checkouts[i]);
-      if (checkout_err == PF_Err_NONE) {
-        input_checkout_success[i] = true;
-        input_world = &input_checkouts[i].u.ld;
-      } else {
-        input_world = &params[MGA_INPUT]->u.ld;
+    A_Matrix4 sample_matrix = layer_matrix;
+    if (has_layer_transform && t_i != in_data->current_time && layerH) {
+      A_Time t = {t_i, in_data->time_scale};
+      A_Time comp_time = t;
+      if (suites.LayerSuite8()) {
+        suites.LayerSuite8()->AEGP_ConvertLayerToCompTime(layerH, &t, &comp_time);
       }
+      suites.LayerSuite8()->AEGP_GetLayerToWorldXform(layerH, &comp_time, &sample_matrix);
     }
 
-    rc.samples[i].boxes =
-        FindTargetBoxes(in_data, input_world, target, word_gap, line_gap);
-    rc.samples[i].input_world = *input_world;
+    rc.samples[i].has_layer_transform = has_layer_transform;
+    if (has_layer_transform) {
+      double sample_rotation = 0.0;
+      double render_cx = 0.0;
+      double render_cy = 0.0;
+      double anim_rot = 0.0;
+
+      if (fd && i < (int)fd->samples.size()) {
+        sample_rotation = fd->samples[i].layer_rotation_rad;
+        render_cx = fd->samples[i].layer_cx;
+        render_cy = fd->samples[i].layer_cy;
+        anim_rot = fd->samples[i].animator_rotation_rad;
+      } else {
+        sample_rotation = layer_rotation_rad;
+        render_cx = layer_cx;
+        render_cy = layer_cy;
+        anim_rot = 0.0;
+      }
+
+      rc.samples[i].layer_cx = render_cx;
+      rc.samples[i].layer_cy = render_cy;
+      rc.samples[i].cos_total_theta = cos(-sample_rotation);
+      rc.samples[i].sin_total_theta = sin(-sample_rotation);
+      rc.samples[i].animator_rotation = anim_rot;
+      rc.samples[i].sample_theta = rc.theta + anim_rot;
+      rc.samples[i].cos_sample_theta = cos(-rc.samples[i].sample_theta);
+      rc.samples[i].sin_sample_theta = sin(-rc.samples[i].sample_theta);
+
+      rc.samples[i].boxes = local_boxes;
+      double delta_x = render_cx - layer_cx;
+      double delta_y = render_cy - layer_cy;
+      for (auto &box : rc.samples[i].boxes) {
+        box.min_x += delta_x;
+        box.max_x += delta_x;
+        box.min_y += delta_y;
+        box.max_y += delta_y;
+      }
+      if (has_main_temp_world) {
+        rc.samples[i].input_world = main_temp_world;
+      } else {
+        rc.samples[i].input_world = *input_world;
+      }
+    } else {
+      rc.samples[i].layer_cx = 0.0;
+      rc.samples[i].layer_cy = 0.0;
+      rc.samples[i].cos_total_theta = 1.0;
+      rc.samples[i].sin_total_theta = 0.0;
+      rc.samples[i].animator_rotation = 0.0;
+      rc.samples[i].sample_theta = rc.theta;
+      rc.samples[i].cos_sample_theta = rc.cos_theta;
+      rc.samples[i].sin_sample_theta = rc.sin_theta;
+
+      rc.samples[i].boxes = local_boxes;
+      rc.samples[i].input_world = *input_world;
+    }
 
     rc.samples[i].has_custom_layer = false;
     if (mode == MGA_MODE_CUSTOM_LAYER) {
@@ -2095,8 +2809,19 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
         max_box_w = w;
       if (h > max_box_h)
         max_box_h = h;
+      if (box.min_x < global_min_x)
+        global_min_x = box.min_x;
+      if (box.max_x > global_max_x)
+        global_max_x = box.max_x;
+      if (box.min_y < global_min_y)
+        global_min_y = box.min_y;
+      if (box.max_y > global_max_y)
+        global_max_y = box.max_y;
     }
   }
+
+  rc.global_cx = has_any_box ? (global_min_x + global_max_x) / 2.0 : 0.0;
+  rc.global_cy = has_any_box ? (global_min_y + global_max_y) / 2.0 : 0.0;
 
   rc.max_char_w = max_box_w;
   rc.max_char_h = max_box_h;
@@ -2107,29 +2832,84 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
   // CallIterate() below, which previously recomputed this same math on
   // every single pixel.
   for (int i = 0; i < rc.num_samples; ++i) {
-    PrecomputeBoxGeometry(rc.samples[i].boxes, &rc, rc.samples[i].precomputed);
+    PrecomputeBoxGeometry(rc.samples[i].boxes, &rc, rc.samples[i].cos_sample_theta, rc.samples[i].sin_sample_theta, rc.samples[i].precomputed);
   }
 
   // Exact rotated bounding box calculation
   double exact_min_x = 999999.0, exact_max_x = -999999.0;
   double exact_min_y = 999999.0, exact_max_y = -999999.0;
 
+  // Include original unshifted bounding boxes to ensure their pixels
+  // are processed (and cleared) if shifted.
   for (int i = 0; i < rc.num_samples; ++i) {
     for (size_t bi = 0; bi < rc.samples[i].boxes.size(); ++bi) {
       const auto &pb = rc.samples[i].precomputed[bi];
-      double b_min_x = pb.box_cx - pb.bound_x;
-      double b_max_x = pb.box_cx + pb.bound_x;
-      double b_min_y = pb.box_cy - pb.bound_y;
-      double b_max_y = pb.box_cy + pb.bound_y;
+      double corners_x[4] = { pb.box_cx - pb.bound_x, pb.box_cx + pb.bound_x, pb.box_cx - pb.bound_x, pb.box_cx + pb.bound_x };
+      double corners_y[4] = { pb.box_cy - pb.bound_y, pb.box_cy - pb.bound_y, pb.box_cy + pb.bound_y, pb.box_cy + pb.bound_y };
 
-      if (b_min_x < exact_min_x)
-        exact_min_x = b_min_x;
-      if (b_max_x > exact_max_x)
-        exact_max_x = b_max_x;
-      if (b_min_y < exact_min_y)
-        exact_min_y = b_min_y;
-      if (b_max_y > exact_max_y)
-        exact_max_y = b_max_y;
+      for (int c = 0; c < 4; ++c) {
+        double xf = corners_x[c];
+        double yf = corners_y[c];
+        if (rc.has_layer_transform) {
+          double dx = corners_x[c] - rc.layer_cx;
+          double dy = corners_y[c] - rc.layer_cy;
+          double cos_l = cos(layer_rotation_rad);
+          double sin_l = sin(layer_rotation_rad);
+          xf = rc.layer_cx + dx * cos_l - dy * sin_l;
+          yf = rc.layer_cy + dx * sin_l + dy * cos_l;
+        }
+        if (xf < exact_min_x) exact_min_x = xf;
+        if (xf > exact_max_x) exact_max_x = xf;
+        if (yf < exact_min_y) exact_min_y = yf;
+        if (yf > exact_max_y) exact_max_y = yf;
+      }
+    }
+  }
+
+  for (int i = 0; i < rc.num_samples; ++i) {
+    for (size_t bi = 0; bi < rc.samples[i].boxes.size(); ++bi) {
+      const auto &pb = rc.samples[i].precomputed[bi];
+
+      int start_col = rc.repeater_enable ? -rc.repeater_count_l : 0;
+      int end_col = rc.repeater_enable ? rc.repeater_count_r : 0;
+      int start_row = rc.repeater_enable ? -rc.repeater_count_u : 0;
+      int end_row = rc.repeater_enable ? rc.repeater_count_d : 0;
+
+      for (int row = start_row; row <= end_row; ++row) {
+        for (int col = start_col; col <= end_col; ++col) {
+          double cx_rep = pb.box_cx + col * (pb.box_w + rc.repeater_gap_x) + row * rc.repeater_offset_x;
+          double cy_rep = pb.box_cy + row * (pb.box_h + rc.repeater_gap_y) + col * rc.repeater_offset_y;
+
+          double corners_x[4] = { cx_rep - pb.bound_x, cx_rep + pb.bound_x, cx_rep - pb.bound_x, cx_rep + pb.bound_x };
+          double corners_y[4] = { cy_rep - pb.bound_y, cy_rep - pb.bound_y, cy_rep + pb.bound_y, cy_rep + pb.bound_y };
+
+          for (int c = 0; c < 4; ++c) {
+            double xf = corners_x[c];
+            double yf = corners_y[c];
+
+            if (rc.repeater_enable) {
+              double dx = corners_x[c] - rc.global_cx;
+              double dy = corners_y[c] - rc.global_cy;
+              xf = rc.global_cx + (dx * rc.repeater_trans_cos - dy * rc.repeater_trans_sin) + rc.repeater_trans_x;
+              yf = rc.global_cy + (dx * rc.repeater_trans_sin + dy * rc.repeater_trans_cos) + rc.repeater_trans_y;
+            }
+
+            if (rc.has_layer_transform) {
+              double dx = xf - rc.layer_cx;
+              double dy = yf - rc.layer_cy;
+              double cos_l = cos(layer_rotation_rad);
+              double sin_l = sin(layer_rotation_rad);
+              xf = rc.layer_cx + dx * cos_l - dy * sin_l;
+              yf = rc.layer_cy + dx * sin_l + dy * cos_l;
+            }
+
+            if (xf < exact_min_x) exact_min_x = xf;
+            if (xf > exact_max_x) exact_max_x = xf;
+            if (yf < exact_min_y) exact_min_y = yf;
+            if (yf > exact_max_y) exact_max_y = yf;
+          }
+        }
+      }
     }
   }
 
@@ -2157,6 +2937,14 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
     if (custom_checkout_success[i]) {
       PF_CHECKIN_PARAM(in_data, &custom_checkouts[i]);
     }
+  }
+
+  for (auto &tw : temp_worlds) {
+    in_data->utils->dispose_world(in_data->effect_ref, &tw);
+  }
+
+  if (in_data->frame_data && suites.HandleSuite1()) {
+    suites.HandleSuite1()->host_unlock_handle(in_data->frame_data);
   }
 
   return err;
@@ -2252,6 +3040,21 @@ static PF_Err UpdateParameterUI(PF_InData *in_data, PF_OutData *out_data,
     // Fill outline hiding (only show in Text Outline mode)
     SetParamHiddenAEGP(MGA_FILL_OUTLINE, mode != MGA_MODE_TEXT_OUTLINE);
 
+    bool repeater_enabled = (GetParamValue(MGA_REPEATER_ENABLE) != 0);
+    SetParamHiddenAEGP(MGA_REPEATER_COUNT_L, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_COUNT_R, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_COUNT_U, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_COUNT_D, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_GAP_X, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_GAP_Y, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_OFFSET_X, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_OFFSET_Y, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_SHOW_TEXT, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_SHOW_SHAPE, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_TRANS_X, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_TRANS_Y, !repeater_enabled);
+    SetParamHiddenAEGP(MGA_REPEATER_TRANS_ROTATE, !repeater_enabled);
+
     suites.EffectSuite4()->AEGP_DisposeEffect(effectH);
   }
   return err;
@@ -2290,6 +3093,14 @@ PF_Err EffectMain(PF_Cmd cmd, PF_InData *in_data, PF_OutData *out_data,
 
     case PF_Cmd_PARAMS_SETUP:
       err = ParamsSetup(in_data, out_data, params, output);
+      break;
+
+    case PF_Cmd_FRAME_SETUP:
+      err = FrameSetup(in_data, out_data, params, output);
+      break;
+
+    case PF_Cmd_FRAME_SETDOWN:
+      err = FrameSetdown(in_data, out_data, params, output);
       break;
 
     case PF_Cmd_RENDER:
