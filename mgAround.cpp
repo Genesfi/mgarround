@@ -231,6 +231,7 @@ struct RenderRefcon {
     bool consistent_size;
     double max_char_w;
     double max_char_h;
+    double common_cy;
 
     double render_min_x;
     double render_max_x;
@@ -289,15 +290,16 @@ inline void PrecomputeBoxGeometry(const std::vector<BBox>& boxes,
         pb.box_h = (H_eval + refcon->render_pad_top + refcon->render_pad_bottom) *
             (refcon->scale_y_pct / 100.0);
 
-        // Geser titik tengah box sesuai selisih padding kiri/kanan & atas/bawah,
-        // supaya nambah pad_right cuma melebarkan ke kanan, bukan dua-duanya.
+        // Geser titik tengah box sesuai selisih padding kiri/kanan & atas/bawah
         double pad_shift_x = (refcon->render_pad_right - refcon->render_pad_left) *
             (refcon->scale_x_pct / 100.0) / 2.0;
         double pad_shift_y = (refcon->render_pad_bottom - refcon->render_pad_top) *
             (refcon->scale_y_pct / 100.0) / 2.0;
 
+        double use_cy = refcon->consistent_size ? (box.max_y - H_eval / 2.0) : cy;
+
         pb.box_cx = cx + refcon->render_offset_x + pad_shift_x;
-        pb.box_cy = cy + refcon->render_offset_y + pad_shift_y;
+        pb.box_cy = use_cy + refcon->render_offset_y + pad_shift_y;
 
         pb.half_w = pb.box_w / 2.0;
         pb.half_h = pb.box_h / 2.0;
@@ -2536,7 +2538,32 @@ static bool GetTextVectorBoxes(
         }
     }
 
-    suites.TextLayerSuite1()->AEGP_DisposeTextOutlines(outlinesH);
+    // Merge inner/outer contour paths of the same glyph (e.g. outer 'e' + inner hole 'e')
+    std::vector<BBox> merged_char_boxes;
+    for (const auto& box : char_boxes) {
+        bool merged = false;
+        for (auto& mbox : merged_char_boxes) {
+            bool is_contained = (box.min_x >= mbox.min_x - 3.0 && box.max_x <= mbox.max_x + 3.0 &&
+                                 box.min_y >= mbox.min_y - 3.0 && box.max_y <= mbox.max_y + 3.0) ||
+                                (mbox.min_x >= box.min_x - 3.0 && mbox.max_x <= box.max_x + 3.0 &&
+                                 mbox.min_y >= box.min_y - 3.0 && mbox.max_y <= box.max_y + 3.0);
+            if (is_contained) {
+                mbox.min_x = min(mbox.min_x, box.min_x);
+                mbox.max_x = max(mbox.max_x, box.max_x);
+                mbox.min_y = min(mbox.min_y, box.min_y);
+                mbox.max_y = max(mbox.max_y, box.max_y);
+                mbox.cx = (mbox.min_x + mbox.max_x) / 2.0;
+                mbox.cy = (mbox.min_y + mbox.max_y) / 2.0;
+                mbox.max_alpha = max(mbox.max_alpha, box.max_alpha);
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            merged_char_boxes.push_back(box);
+        }
+    }
+    char_boxes = std::move(merged_char_boxes);
 
     if (!char_boxes.empty()) {
         out_boxes = std::move(char_boxes);
@@ -3153,6 +3180,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data,
     rc.repeater_trans_y = render_repeater_trans_y;
     rc.repeater_trans_cos = trans_cos;
     rc.repeater_trans_sin = trans_sin;
+    rc.consistent_size = consistent_size;
 
     rc.num_samples = (int)sample_times.size();
     rc.samples.resize(rc.num_samples);
@@ -3216,6 +3244,25 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data,
             local_boxes = FindTargetBoxes(in_data, input_world, target, word_gap, line_gap);
         }
     }
+
+    double max_char_w = 0.0;
+    double max_char_h = 0.0;
+    double common_cy = 0.0;
+    if (consistent_size && !local_boxes.empty()) {
+        for (const auto& box : local_boxes) {
+            double bw = box.max_x - box.min_x + 1.0;
+            double bh = box.max_y - box.min_y + 1.0;
+            if (bw > max_char_w) max_char_w = bw;
+            if (bh > max_char_h) max_char_h = bh;
+            common_cy += box.cy;
+        }
+        common_cy /= local_boxes.size();
+    }
+
+    rc.consistent_size = consistent_size;
+    rc.max_char_w = max_char_w;
+    rc.max_char_h = max_char_h;
+    rc.common_cy = common_cy;
 
     for (int i = 0; i < rc.num_samples; ++i) {
         A_long t_i = sample_times[i];
@@ -3346,8 +3393,10 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data,
     rc.global_cx = has_any_box ? (global_min_x + global_max_x) / 2.0 : 0.0;
     rc.global_cy = has_any_box ? (global_min_y + global_max_y) / 2.0 : 0.0;
 
-    rc.max_char_w = max_box_w;
-    rc.max_char_h = max_box_h;
+    if (!rc.consistent_size) {
+        rc.max_char_w = max_box_w;
+        rc.max_char_h = max_box_h;
+    }
 
     // OPTIMIZATION #1: precompute box geometry once per box, per sample --
     // must happen after rc.max_char_w / rc.max_char_h are known (since
