@@ -1036,58 +1036,40 @@ inline void RefineSubpixelBBoxes(std::vector<BBox>& boxes,
     }
 }
 
-static PF_Err UnrotateInputWorld(PF_InData* in_data, const PF_EffectWorld* input, double theta, double cx, double cy, PF_EffectWorld* output) {
-    PF_Err err = PF_Err_NONE;
-    int width = input->width;
-    int height = input->height;
-    bool is_deep = PF_WORLD_IS_DEEP(input);
-
-    // Clear output to transparent
-    for (int y = 0; y < height; ++y) {
+static void UnrotateChunk(
+    int start_y, int end_y, int width, int height,
+    const PF_EffectWorld* input, PF_EffectWorld* output,
+    double cos_t, double sin_t, double cx, double cy, bool is_deep) {
+    for (int y = start_y; y < end_y; ++y) {
         if (is_deep) {
             PF_Pixel16* row = (PF_Pixel16*)((char*)output->data + y * output->rowbytes);
             for (int x = 0; x < width; ++x) {
-                row[x].alpha = 0;
-                row[x].red = 0;
-                row[x].green = 0;
-                row[x].blue = 0;
-            }
-        }
-        else {
-            PF_Pixel8* row = (PF_Pixel8*)((char*)output->data + y * output->rowbytes);
-            for (int x = 0; x < width; ++x) {
-                row[x].alpha = 0;
-                row[x].red = 0;
-                row[x].green = 0;
-                row[x].blue = 0;
-            }
-        }
-    }
+                double dx = (double)x - cx;
+                double dy = (double)y - cy;
+                double rx = cx + dx * cos_t - dy * sin_t;
+                double ry = cy + dx * sin_t + dy * cos_t;
 
-    double cos_t = cos(theta);
-    double sin_t = sin(theta);
-
-    // Fill output by sampling from input using forward rotation
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            double dx = (double)x - cx;
-            double dy = (double)y - cy;
-            double rx = cx + dx * cos_t - dy * sin_t;
-            double ry = cy + dx * sin_t + dy * cos_t;
-
-            if (rx >= 0.0 && rx < width && ry >= 0.0 && ry < height) {
-                double r = 0.0, g = 0.0, b = 0.0, a = 0.0;
-                if (is_deep) {
+                if (rx >= 0.0 && rx < width && ry >= 0.0 && ry < height) {
+                    double r = 0.0, g = 0.0, b = 0.0, a = 0.0;
                     sample_bilinear_xy<PF_Pixel16, PF_Pixel16>(input, rx, ry, &r, &g, &b, &a, 32768.0);
-                    PF_Pixel16* row = (PF_Pixel16*)((char*)output->data + y * output->rowbytes);
                     row[x].alpha = (A_u_short)clamped_channel(a * 32768.0, 32768.0);
                     row[x].red = (A_u_short)clamped_channel(r * 32768.0, 32768.0);
                     row[x].green = (A_u_short)clamped_channel(g * 32768.0, 32768.0);
                     row[x].blue = (A_u_short)clamped_channel(b * 32768.0, 32768.0);
                 }
-                else {
+            }
+        }
+        else {
+            PF_Pixel8* row = (PF_Pixel8*)((char*)output->data + y * output->rowbytes);
+            for (int x = 0; x < width; ++x) {
+                double dx = (double)x - cx;
+                double dy = (double)y - cy;
+                double rx = cx + dx * cos_t - dy * sin_t;
+                double ry = cy + dx * sin_t + dy * cos_t;
+
+                if (rx >= 0.0 && rx < width && ry >= 0.0 && ry < height) {
+                    double r = 0.0, g = 0.0, b = 0.0, a = 0.0;
                     sample_bilinear_xy<PF_Pixel8, PF_Pixel8>(input, rx, ry, &r, &g, &b, &a, 255.0);
-                    PF_Pixel8* row = (PF_Pixel8*)((char*)output->data + y * output->rowbytes);
                     row[x].alpha = (A_u_char)clamped_channel(a * 255.0, 255.0);
                     row[x].red = (A_u_char)clamped_channel(r * 255.0, 255.0);
                     row[x].green = (A_u_char)clamped_channel(g * 255.0, 255.0);
@@ -1096,6 +1078,47 @@ static PF_Err UnrotateInputWorld(PF_InData* in_data, const PF_EffectWorld* input
             }
         }
     }
+}
+
+static PF_Err UnrotateInputWorld(PF_InData* in_data, const PF_EffectWorld* input, double theta, double cx, double cy, PF_EffectWorld* output) {
+    PF_Err err = PF_Err_NONE;
+    int width = input->width;
+    int height = input->height;
+    bool is_deep = PF_WORLD_IS_DEEP(input);
+
+    const size_t pixel_size = is_deep ? sizeof(PF_Pixel16) : sizeof(PF_Pixel8);
+    for (int y = 0; y < height; ++y) {
+        void* dst_row = (char*)output->data + y * output->rowbytes;
+        memset(dst_row, 0, (size_t)width * pixel_size);
+    }
+
+    double cos_t = cos(theta);
+    double sin_t = sin(theta);
+
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+    num_threads = min(num_threads, 16u);
+
+    int chunk_size = (height + (int)num_threads - 1) / (int)num_threads;
+    if (chunk_size == 0) chunk_size = 1;
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        int start_y = (int)i * chunk_size;
+        int end_y = min(height, start_y + chunk_size);
+        if (start_y < end_y) {
+            threads.emplace_back(UnrotateChunk, start_y, end_y, width, height, input, output, cos_t, sin_t, cx, cy, is_deep);
+        }
+    }
+
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
     return err;
 }
 
@@ -1307,12 +1330,14 @@ std::vector<BBox> FindTargetBoxes(PF_InData* in_data, PF_EffectWorld* input,
                 int neighbor_count = 0;
                 if (x > 0 && labels[y * w_tb + x - 1] > 0)
                     neighbors[neighbor_count++] = labels[y * w_tb + x - 1];
-                if (x > 0 && y > 0 && labels[(y - 1) * w_tb + x - 1] > 0)
-                    neighbors[neighbor_count++] = labels[(y - 1) * w_tb + x - 1];
                 if (y > 0 && labels[(y - 1) * w_tb + x] > 0)
                     neighbors[neighbor_count++] = labels[(y - 1) * w_tb + x];
-                if (x < w_tb - 1 && y > 0 && labels[(y - 1) * w_tb + x + 1] > 0)
-                    neighbors[neighbor_count++] = labels[(y - 1) * w_tb + x + 1];
+                if (target_mode != MGA_TARGET_CHAR) {
+                    if (x > 0 && y > 0 && labels[(y - 1) * w_tb + x - 1] > 0)
+                        neighbors[neighbor_count++] = labels[(y - 1) * w_tb + x - 1];
+                    if (x < w_tb - 1 && y > 0 && labels[(y - 1) * w_tb + x + 1] > 0)
+                        neighbors[neighbor_count++] = labels[(y - 1) * w_tb + x + 1];
+                }
 
                 if (neighbor_count == 0) {
                     labels[y * w_tb + x] = next_label;
@@ -2345,6 +2370,97 @@ static double GetTextLayerAnimatorRotation(
     return accum_rotation_rad;
 }
 
+static bool GetTextVectorBoxes(
+    PF_InData* in_data,
+    AEGP_SuiteHandler& suites,
+    AEGP_LayerH layerH,
+    const A_Time* comp_time,
+    const PF_EffectWorld* input_world,
+    std::vector<BBox>& out_boxes) {
+    out_boxes.clear();
+    if (!layerH || !suites.TextLayerSuite1() || !suites.PathDataSuite1() || !input_world) {
+        return false;
+    }
+
+    AEGP_TextOutlinesH outlinesH = NULL;
+    A_Err err = suites.TextLayerSuite1()->AEGP_GetNewTextOutlines(layerH, comp_time, &outlinesH);
+    if (err != A_Err_NONE || !outlinesH) {
+        return false;
+    }
+
+    A_long num_outlines = 0;
+    suites.TextLayerSuite1()->AEGP_GetNumTextOutlines(outlinesH, &num_outlines);
+
+    double scale_x = (double)in_data->downsample_x.num / in_data->downsample_x.den;
+    double scale_y = (double)in_data->downsample_y.num / in_data->downsample_y.den;
+
+    bool is_deep = PF_WORLD_IS_DEEP(input_world);
+    int img_w = input_world->width;
+    int img_h = input_world->height;
+
+    for (A_long i = 0; i < num_outlines; ++i) {
+        PF_PathOutlinePtr pathP = NULL;
+        if (suites.TextLayerSuite1()->AEGP_GetIndexedTextOutline(outlinesH, i, &pathP) == A_Err_NONE && pathP) {
+            A_long num_segments = 0;
+            if (suites.PathDataSuite1()->PF_PathNumSegments(in_data->effect_ref, pathP, &num_segments) == A_Err_NONE && num_segments > 0) {
+                double b_min_x = 999999.0, b_max_x = -999999.0;
+                double b_min_y = 999999.0, b_max_y = -999999.0;
+                bool valid_vertex = false;
+
+                for (A_long v = 0; v <= num_segments; ++v) {
+                    PF_PathVertex vert;
+                    if (suites.PathDataSuite1()->PF_PathVertexInfo(in_data->effect_ref, pathP, v, &vert) == A_Err_NONE) {
+                        double vx = vert.x * scale_x;
+                        double vy = vert.y * scale_y;
+                        if (vx < b_min_x) b_min_x = vx;
+                        if (vx > b_max_x) b_max_x = vx;
+                        if (vy < b_min_y) b_min_y = vy;
+                        if (vy > b_max_y) b_max_y = vy;
+                        valid_vertex = true;
+                    }
+                }
+
+                if (valid_vertex && b_max_x >= b_min_x && b_max_y >= b_min_y) {
+                    // Check rendered alpha of this character in input_world
+                    double char_max_alpha = 0.0;
+                    int x0 = max(0, (int)floor(b_min_x));
+                    int x1 = min(img_w - 1, (int)ceil(b_max_x));
+                    int y0 = max(0, (int)floor(b_min_y));
+                    int y1 = min(img_h - 1, (int)ceil(b_max_y));
+
+                    for (int sy = y0; sy <= y1; ++sy) {
+                        void* row_ptr = (char*)input_world->data + sy * input_world->rowbytes;
+                        for (int sx = x0; sx <= x1; ++sx) {
+                            double a = is_deep 
+                                ? (((PF_Pixel16*)row_ptr)[sx].alpha / 32768.0)
+                                : (((PF_Pixel8*)row_ptr)[sx].alpha / 255.0);
+                            if (a > char_max_alpha) {
+                                char_max_alpha = a;
+                            }
+                        }
+                    }
+
+                    // Skip hidden characters (Opacity Animator set alpha to 0)
+                    if (char_max_alpha > 0.02) {
+                        BBox char_box;
+                        char_box.min_x = b_min_x;
+                        char_box.max_x = b_max_x;
+                        char_box.min_y = b_min_y;
+                        char_box.max_y = b_max_y;
+                        char_box.cx = (b_min_x + b_max_x) / 2.0;
+                        char_box.cy = (b_min_y + b_max_y) / 2.0;
+                        char_box.max_alpha = char_max_alpha;
+                        out_boxes.push_back(char_box);
+                    }
+                }
+            }
+        }
+    }
+
+    suites.TextLayerSuite1()->AEGP_DisposeTextOutlines(outlinesH);
+    return !out_boxes.empty();
+}
+
 struct SampleTransform {
     bool has_layer_transform;
     double layer_rotation_rad;
@@ -2919,22 +3035,31 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data,
 
     PF_EffectWorld* input_world = &params[MGA_INPUT]->u.ld;
 
-    // Text layers report a transform even when effective rotation is zero.
-    // Avoid allocating and bilinearly resampling the complete frame in that
-    // common case; non-zero layer/animator rotation keeps the original path.
-    const bool needs_unrotate =
-        has_layer_transform && abs(main_total_rotation) > 1.0e-7;
-    if (needs_unrotate) {
-        A_Err new_world_err = in_data->utils->new_world(in_data->effect_ref, input_world->width, input_world->height, PF_NewWorldFlag_NONE, &main_temp_world);
-        if (new_world_err == PF_Err_NONE) {
-            UnrotateInputWorld(in_data, input_world, main_total_rotation, layer_cx, layer_cy, &main_temp_world);
-            local_boxes = FindTargetBoxes(in_data, &main_temp_world, target, word_gap, line_gap);
-            has_main_temp_world = true;
-            temp_worlds.push_back(main_temp_world);
+    bool got_vector_boxes = false;
+    if (is_text && layerH && target == MGA_TARGET_CHAR) {
+        A_Time t = { in_data->current_time, in_data->time_scale };
+        A_Time comp_time = t;
+        if (suites.LayerSuite8()) {
+            suites.LayerSuite8()->AEGP_ConvertLayerToCompTime(layerH, &t, &comp_time);
         }
+        got_vector_boxes = GetTextVectorBoxes(in_data, suites, layerH, &comp_time, input_world, local_boxes);
     }
-    else {
-        local_boxes = FindTargetBoxes(in_data, input_world, target, word_gap, line_gap);
+
+    if (!got_vector_boxes) {
+        const bool needs_unrotate =
+            has_layer_transform && abs(main_total_rotation) > 1.0e-7;
+        if (needs_unrotate) {
+            A_Err new_world_err = in_data->utils->new_world(in_data->effect_ref, input_world->width, input_world->height, PF_NewWorldFlag_NONE, &main_temp_world);
+            if (new_world_err == PF_Err_NONE) {
+                UnrotateInputWorld(in_data, input_world, main_total_rotation, layer_cx, layer_cy, &main_temp_world);
+                local_boxes = FindTargetBoxes(in_data, &main_temp_world, target, word_gap, line_gap);
+                has_main_temp_world = true;
+                temp_worlds.push_back(main_temp_world);
+            }
+        }
+        else {
+            local_boxes = FindTargetBoxes(in_data, input_world, target, word_gap, line_gap);
+        }
     }
 
     for (int i = 0; i < rc.num_samples; ++i) {
